@@ -62,6 +62,32 @@ pub struct NodeClient {
 }
 
 impl NodeClient {
+	pub async fn reserve_sandbox(
+		&self,
+		id: &str,
+		req: &crate::api::ReserveSandbox,
+	) -> Result<(), NodeError> {
+		self
+			.empty(
+				Method::POST,
+				&format!("/sandboxes/{id}/reservation"),
+				Some(req),
+				Duration::from_secs(10),
+			)
+			.await
+	}
+
+	pub async fn release_reservation(&self, id: &str, token: &str) -> Result<(), NodeError> {
+		self
+			.empty::<()>(
+				Method::DELETE,
+				&format!("/sandboxes/{id}/reservation/{token}"),
+				None,
+				Duration::from_secs(10),
+			)
+			.await
+	}
+
 	/// `cluster_url` is the member's route (`MemberMeta::cluster_url`,
 	/// `Cluster::cluster_url`); `http` is a shared connection pool.
 	pub fn new(cluster_url: &str, secret: &str, http: reqwest::Client) -> Result<Self, NodeError> {

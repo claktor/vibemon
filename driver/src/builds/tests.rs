@@ -126,6 +126,7 @@ fn artifact(build_id: &str) -> ArtifactInfo {
 
 fn capacity() -> NodeCapacity {
 	NodeCapacity {
+		resources:      None,
 		arch:           "x86_64".into(),
 		backend:        "kvm".into(),
 		os:             "linux".into(),

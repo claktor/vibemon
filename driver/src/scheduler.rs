@@ -153,12 +153,14 @@ pub struct Scheduler {
 /// Create counters for one node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NodeCounters {
-	pub inflight:      u32,
+	pub inflight_vcpus:     u64,
+	pub inflight_memory_mb: u64,
+	pub inflight:           u32,
 	/// GPUs requested by the in-flight creates (not yet visible as held in
 	/// the node's gossip capacity).
-	pub inflight_gpus: u32,
-	pub successes:     u64,
-	pub fails:         u64,
+	pub inflight_gpus:      u32,
+	pub successes:          u64,
+	pub fails:              u64,
 }
 
 /// Marks one create as in flight on a node until [`InflightGuard::finish`] or
@@ -167,6 +169,8 @@ pub struct InflightGuard<'a> {
 	scheduler: &'a Scheduler,
 	node:      NodeId,
 	gpus:      u32,
+	vcpus:     u32,
+	memory_mb: u64,
 	done:      bool,
 }
 
@@ -190,12 +194,14 @@ impl Scheduler {
 
 	/// Registers a create of a sandbox with `gpus` GPUs in flight on `node`;
 	/// called by the lifecycle create path.
-	pub fn begin(&self, node: NodeId, gpus: u32) -> InflightGuard<'_> {
+	pub fn begin(&self, node: NodeId, gpus: u32, vcpus: u32, memory_mb: u64) -> InflightGuard<'_> {
 		let mut counters = self.counters.lock();
 		let entry = counters.entry(node).or_default();
 		entry.inflight += 1;
 		entry.inflight_gpus += gpus;
-		InflightGuard { scheduler: self, node, gpus, done: false }
+		entry.inflight_vcpus += u64::from(vcpus);
+		entry.inflight_memory_mb += memory_mb;
+		InflightGuard { scheduler: self, node, gpus, vcpus, memory_mb, done: false }
 	}
 
 	/// Prefers the paused owner, then a snapshot-compatible node. Only falls
@@ -284,6 +290,8 @@ impl InflightGuard<'_> {
 		let entry = counters.entry(self.node).or_default();
 		entry.inflight = entry.inflight.saturating_sub(1);
 		entry.inflight_gpus = entry.inflight_gpus.saturating_sub(self.gpus);
+		entry.inflight_vcpus = entry.inflight_vcpus.saturating_sub(u64::from(self.vcpus));
+		entry.inflight_memory_mb = entry.inflight_memory_mb.saturating_sub(self.memory_mb);
 		match outcome {
 			Some(CreateOutcome::Success) => entry.successes += 1,
 			Some(CreateOutcome::Failure) | None => entry.fails += 1,
@@ -346,10 +354,27 @@ pub fn eligible<S: BuildHasher>(
 		{
 			continue;
 		}
-		let vcpu_cap = u64::from(cap.cpus) * VCPU_OVERCOMMIT;
-		let mem_cap = cap.memory_mb * MEMORY_OVERCOMMIT;
-		let vcpu_after = u64::from(cap.vcpus_used) + u64::from(req.vcpus);
-		let mem_after = cap.memory_used_mb + req.memory_mb;
+		let (vcpu_cap, mem_cap, vcpu_after, mem_after) = if let Some(budget) = &cap.resources {
+			let cpu = u64::from(req.vcpus).saturating_add(counters.inflight_vcpus);
+			let memory = req.memory_mb.saturating_add(counters.inflight_memory_mb);
+			let count = u64::from(counters.inflight) + 1;
+			if !budget.fits(cpu, memory, count) {
+				continue;
+			}
+			(
+				u64::from(budget.vcpus),
+				budget.memory_mb,
+				budget.reserved_vcpus + cpu,
+				budget.reserved_memory_mb + memory + count * budget.overhead_mb,
+			)
+		} else {
+			(
+				u64::from(cap.cpus) * VCPU_OVERCOMMIT,
+				cap.memory_mb.saturating_mul(MEMORY_OVERCOMMIT),
+				u64::from(cap.vcpus_used) + u64::from(req.vcpus),
+				cap.memory_used_mb.saturating_add(req.memory_mb),
+			)
+		};
 		if vcpu_after > vcpu_cap || mem_after > mem_cap || cap.disk_free_mb < MIN_FREE_DISK_MB {
 			continue;
 		}
@@ -416,6 +441,64 @@ mod tests {
 	use vmon_cluster::Roles;
 
 	use super::*;
+
+	#[test]
+	fn bounded_nodes_count_pending_overhead_and_inflight_without_overcommit() {
+		let members = [node(1, |cap| {
+			cap.resources = Some(vmon_cluster::ResourceCapacity {
+				version: 1,
+				enforcement: "admission".into(),
+				vcpus: 4,
+				memory_mb: 4096,
+				reserved_vcpus: 2,
+				reserved_memory_mb: 2048,
+				overhead_mb: 512,
+				..Default::default()
+			});
+		})];
+		let request = PlacementRequest { vcpus: 2, memory_mb: 1536, ..Default::default() };
+		assert!(eligible(&members, &HashMap::new(), &request, |_| NodeCounters::default()).is_ok());
+		let inflight = NodeCounters {
+			inflight: 1,
+			inflight_vcpus: 1,
+			inflight_memory_mb: 128,
+			..Default::default()
+		};
+		assert_eq!(
+			eligible(&members, &HashMap::new(), &request, |_| inflight).unwrap_err(),
+			Unplaceable::NoCapacity
+		);
+		let request = PlacementRequest { memory_mb: 1537, ..request };
+		assert_eq!(
+			eligible(&members, &HashMap::new(), &request, |_| NodeCounters::default()).unwrap_err(),
+			Unplaceable::NoCapacity
+		);
+	}
+
+	#[test]
+	fn pressure_or_unknown_budget_version_closes_placement() {
+		for (version, reason) in [(1, Some("host pressure".into())), (2, None)] {
+			let members = [node(1, |cap| {
+				cap.resources = Some(vmon_cluster::ResourceCapacity {
+					version,
+					admission_reason: reason,
+					vcpus: 8,
+					memory_mb: 16384,
+					..Default::default()
+				});
+			})];
+			assert_eq!(
+				eligible(
+					&members,
+					&HashMap::new(),
+					&PlacementRequest { vcpus: 1, memory_mb: 128, ..Default::default() },
+					|_| NodeCounters::default()
+				)
+				.unwrap_err(),
+				Unplaceable::NoCapacity
+			);
+		}
+	}
 
 	fn node(id: u64, f: impl FnOnce(&mut NodeCapacity)) -> (NodeId, MemberMeta) {
 		let mut cap = NodeCapacity {
@@ -752,16 +835,18 @@ mod tests {
 	#[test]
 	fn inflight_guard_counts_outcomes_and_drop_as_failure() {
 		let s = Scheduler::default();
-		let g = s.begin(NodeId(1), 2);
+		let g = s.begin(NodeId(1), 2, 1, 512);
 		assert_eq!(s.node_counters(NodeId(1)).inflight, 1);
 		assert_eq!(s.node_counters(NodeId(1)).inflight_gpus, 2);
 		g.finish(CreateOutcome::Success);
-		drop(s.begin(NodeId(1), 0));
+		drop(s.begin(NodeId(1), 0, 1, 512));
 		assert_eq!(s.node_counters(NodeId(1)), NodeCounters {
-			inflight:      0,
-			inflight_gpus: 0,
-			successes:     1,
-			fails:         1,
+			inflight_vcpus:     0,
+			inflight_memory_mb: 0,
+			inflight:           0,
+			inflight_gpus:      0,
+			successes:          1,
+			fails:              1,
 		});
 	}
 }

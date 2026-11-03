@@ -115,6 +115,7 @@ pub struct Config {
 	pub rootfs_remote_etag: Option<String>,
 	/// Hint host KSM to merge identical guest RAM pages across co-resident VMs.
 	pub ksm: bool,
+	pub no_hugepages: bool,
 	pub cpus: u8,
 	pub rootfs: Option<PathBuf>,
 	pub rootfs_read_only: bool,
@@ -283,7 +284,11 @@ struct CliArgs {
 
 	/// madvise(MADV_MERGEABLE) guest RAM for host KSM dedup
 	#[arg(long)]
-	ksm: bool,
+	ksm:          bool,
+	/// Never allocate explicit hugetlb memory (transparent huge pages remain
+	/// allowed).
+	#[arg(long)]
+	no_hugepages: bool,
 
 	/// Number of vCPUs
 	#[arg(long, value_name = "N", default_value_t = 1)]
@@ -1020,6 +1025,7 @@ impl Config {
 			rootfs_remote_region: cli.rootfs_remote_region,
 			rootfs_remote_etag: cli.rootfs_remote_etag,
 			ksm: cli.ksm,
+			no_hugepages: cli.no_hugepages,
 			cpus: cpus as u8,
 			rootfs: cli.rootfs,
 			rootfs_read_only: cli.rootfs_ro,

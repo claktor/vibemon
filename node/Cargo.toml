@@ -53,3 +53,6 @@ vmm = { path = "../vmm" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 vmon-cloud = { workspace = true, features = ["fake"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2.workspace = true

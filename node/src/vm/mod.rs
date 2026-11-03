@@ -186,6 +186,7 @@ pub struct VmExit {
 /// Construction parameters of [`VmRuntime`].
 #[derive(Debug)]
 pub struct VmRuntimeConfig {
+	pub resources:        crate::resources::Resources,
 	/// The `vmon` binary (`current_exe()`), run as `vmon vmm …`.
 	pub vmon_bin:         PathBuf,
 	/// Parent of the per-VM socket dirs (short path; 0700).
@@ -238,6 +239,28 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
 			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 	{
 		bail!("invalid vm name {name:?}");
+	}
+	Ok(())
+}
+
+fn ensure_managed_args(args: &[String]) -> anyhow::Result<()> {
+	for arg in args {
+		let key = arg.split('=').next().unwrap_or(arg);
+		if matches!(
+			key,
+			"--jail"
+				| "--count"
+				| "--cpus"
+				| "--mem"
+				| "--mem-mib"
+				| "--fork-from"
+				| "--restore"
+				| "--cgroup-mode"
+				| "--cgroup-cpu-max"
+				| "--cgroup-mem-max"
+		) {
+			bail!("managed VM cannot override resource or cgroup arguments: {key}");
+		}
 	}
 	Ok(())
 }
@@ -315,6 +338,10 @@ fn chown_path(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
 }
 
 impl VmRuntime {
+	pub fn resources(&self) -> &crate::resources::Resources {
+		&self.inner.config.resources
+	}
+
 	/// Creates the runtime; the run dir is created 0700.
 	pub fn new(config: VmRuntimeConfig) -> anyhow::Result<Self> {
 		private_dir(&config.run_dir)
@@ -345,6 +372,19 @@ impl VmRuntime {
 	/// error carries the console and VMM log tails.
 	pub async fn launch(&self, spec: VmSpec) -> anyhow::Result<Vm> {
 		validate_name(&spec.name)?;
+		let (vcpus, memory_mb) = if self.resources().bounded() {
+			match &spec.boot {
+				Boot::Cold { .. } => (spec.vcpus, spec.memory_mb),
+				Boot::Fork { snapshot } | Boot::RemotePages { snapshot, .. } => {
+					let image = vmm::snapshot::read_snapshot_metadata(snapshot)
+						.map_err(|e| anyhow!("reading snapshot resources: {e}"))?;
+					(u32::from(image.snapshot().cpus), u64::try_from(image.snapshot().mem_mib)?)
+				},
+			}
+		} else {
+			(spec.vcpus, spec.memory_mb)
+		};
+		let reservation = self.resources().for_launch(&spec.name, vcpus, memory_mb)?;
 		let _permit = self
 			.inner
 			.boot
@@ -398,10 +438,13 @@ impl VmRuntime {
 			.open(&vmm_log_path)?;
 		let started = Instant::now();
 		let mut command = tokio::process::Command::new(&self.inner.config.vmon_bin);
+		if self.resources().bounded() {
+			ensure_managed_args(&spec.extra_args)?;
+		}
 		if let Boot::RemotePages { pages, .. } = &spec.boot {
 			command.env("VMON_REMOTE_PAGE_TOKEN", &pages.token);
 		}
-		let mut child = command
+		command
 			.arg("vmm")
 			.args(&args)
 			.stdin(Stdio::null())
@@ -409,21 +452,30 @@ impl VmRuntime {
 			.stderr(vmm_log)
 			// VMMs outlive a node restart (restart recovery adopts them).
 			.process_group(0)
-			.kill_on_drop(false)
+			.kill_on_drop(false);
+		if self.resources().bounded() {
+			command.arg("--no-hugepages");
+		}
+		let child_lease = reservation.prepare(&mut command)?;
+		let mut child = command
 			.spawn()
 			.with_context(|| format!("spawning {} vmm", self.inner.config.vmon_bin.display()))?;
+		drop(child_lease);
 		let pid = child
 			.id()
 			.ok_or_else(|| anyhow!("vmm exited immediately"))?;
 		let (exit_tx, exit_rx) = watch::channel(None);
 		let status_dir = run_dir.clone();
+		let identity_result = reservation.record_process(pid);
 		tokio::spawn(async move {
+			let _reservation = reservation;
 			let status = child.wait().await;
 			let exit =
 				VmExit { code: status.ok().and_then(|s| s.code()), reason: read_status(&status_dir) };
 			let _ = exit_tx.send(Some(exit));
 		});
 		let mut abandoned = KillOnDrop(Some(pid));
+		identity_result?;
 		let control = ControlClient::new(api_sock);
 		let ready = wait_ready(&control, &agent_sock, &exit_rx, spec.ready_timeout).await;
 		abandoned.0 = None;
@@ -461,6 +513,7 @@ impl VmRuntime {
 	/// the agent with a fresh epoch.
 	pub async fn adopt(&self, name: &str, pid: u32, console_log: PathBuf) -> anyhow::Result<Vm> {
 		validate_name(name)?;
+		self.resources().verify_adoption(name, pid)?;
 		if !pid_alive(pid) {
 			bail!("vmm pid {pid} is gone");
 		}
@@ -471,8 +524,10 @@ impl VmRuntime {
 		let agent = AgentClient::connect(&agent_sock, Duration::from_secs(10)).await?;
 		let (exit_tx, exit_rx) = watch::channel(None);
 		let status_dir = run_dir.clone();
+		let resources = self.resources().clone();
+		let adopted_name = name.to_owned();
 		tokio::spawn(async move {
-			while pid_alive(pid) {
+			while pid_alive(pid) && resources.verify_adoption(&adopted_name, pid).is_ok() {
 				tokio::time::sleep(Duration::from_millis(500)).await;
 			}
 			let _ = exit_tx.send(Some(VmExit { code: None, reason: read_status(&status_dir) }));
@@ -724,6 +779,7 @@ mod tests {
 			.unwrap();
 		fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 		let runtime = VmRuntime::new(VmRuntimeConfig {
+			resources:        Default::default(),
 			vmon_bin:         fake,
 			run_dir:          dir.path().join("run"),
 			boot_concurrency: 1,

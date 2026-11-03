@@ -683,6 +683,34 @@ under the 104-byte macOS `sun_path` limit.
 
 ### 8.2 VM runtime
 
+`node::resources` is the authoritative admission ledger for bounded nodes.
+`--resource-policy reserved` works on Linux/macOS; `strict` additionally
+requires a delegated Linux cgroup v2 hierarchy with finite ancestor CPU/RAM
+limits, a lower memory pressure threshold and no swap. Legacy defaults keep
+the previous scheduling behavior. Operator configuration is separate from
+team/job limits; see [resource budgets](docs/src/operate/serve.md#node-resource-budgets).
+
+Create, resume, handover and build operations reserve full guest RAM plus
+VMM overhead and vCPUs atomically before preparation. Build phases share a
+peak reservation. Launch reads a fork/restore snapshot's actual size and
+enlarges the reservation before starting it. A reservation permits only one
+live VMM at a time. Bounded nodes allow one concurrent boot and one build.
+Inherited flock descriptors keep the durable reservation charged until
+process exit, even if its request is dropped or the node restarts. Recovery
+also checks cgroup population and process identity; unaccounted workloads
+close admission. Linux places the VMM in its capped workload cgroup before
+exec and disables explicit hugetlb allocation. Node/transfer helpers remain
+inside the finite parent envelope; per-workload OOM handling never groups
+the entire service. macOS exposes admission enforcement explicitly, without
+claiming kernel aggregate CPU/RAM ceilings. Host memory pressure and an
+operator reserve floor gate admission with a recovery margin.
+
+Migration obtains a renewable target reservation before pausing its source.
+The node API adds `POST /sandboxes/{id}/reservation` with
+`ReserveSandbox{token,vcpus,memoryMb}` and
+`DELETE /sandboxes/{id}/reservation/{token}`. Holds expire after 60 seconds
+without renewal; a running operation or VMM still holds its own reference.
+
 - Launch = self-exec `current_exe() vmm …` (see `vmm` CLI). Every VM gets
   `--api-sock`, `--agent-sock`, `--snapshot-root`, `--rng`, a rootfs CoW
   overlay (`--disk-overlay-of <build rootfs> --rootfs <sandbox>/rootfs.img`),
@@ -1392,6 +1420,14 @@ served at `/dashboard/` on the public listeners):
   `POST /auth/revoke`.
 
 ### 9.3 Placement
+
+An optional, versioned `NodeCapacity.resources` reports bounded admission,
+including reservations (pending and running), per-VMM overhead, configured
+capacity, kernel limits/usage where supported, and the admission pause
+reason. New drivers apply no overcommit to this record and also subtract
+their own in-flight CPU/RAM commitments. Builds use the same budget. Older
+drivers may attempt placements from stale/legacy hints; node-local admission
+remains authoritative. Unknown budget versions are not placement targets.
 
 Candidates: gossip members with `roles.node`, `Alive`, not draining/unhealthy,
 matching required features (egress features, volume locality), `arch`

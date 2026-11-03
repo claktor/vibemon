@@ -16,16 +16,100 @@ const OTHER: NodeId = NodeId(0x00d3);
 /// other fake nodes it pulls paused state from.
 #[derive(Default)]
 pub(super) struct FakeMigration {
+	pub(super) reservations:       Vec<(String, vmon_node::api::ReserveSandbox)>,
+	pub(super) released:           Vec<String>,
+	pub(super) refuse_reservation: bool,
 	/// `POST /sandboxes/{id}/adopt` requests.
-	pub(super) adopts:      Vec<(String, AdoptSandbox)>,
+	pub(super) adopts:             Vec<(String, AdoptSandbox)>,
 	/// `DELETE /sandboxes/{id}/paused` calls.
-	pub(super) drops:       Vec<String>,
+	pub(super) drops:              Vec<String>,
 	/// Pauses that were the source side of a handover.
-	pub(super) handovers:   Vec<String>,
+	pub(super) handovers:          Vec<String>,
 	/// The next this many adoptions fail like a node out of disk.
-	pub(super) fail_adopts: u32,
+	pub(super) fail_adopts:        u32,
 	/// Fake nodes by node id.
-	pub(super) peers:       BTreeMap<NodeId, Weak<Mutex<FakeNode>>>,
+	pub(super) peers:              BTreeMap<NodeId, Weak<Mutex<FakeNode>>>,
+}
+
+pub(super) async fn fake_reserve(
+	State(node): State<Shared>,
+	UrlPath(id): UrlPath<String>,
+	Json(req): Json<vmon_node::api::ReserveSandbox>,
+) -> Response {
+	let mut node = node.lock();
+	node.migration.reservations.push((id, req));
+	if node.migration.refuse_reservation {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(json!({"code":"busy", "message":"node budget exhausted"})),
+		)
+			.into_response();
+	}
+	StatusCode::NO_CONTENT.into_response()
+}
+
+pub(super) async fn fake_release(
+	State(node): State<Shared>,
+	UrlPath((_id, token)): UrlPath<(String, String)>,
+) -> StatusCode {
+	node.lock().migration.released.push(token);
+	StatusCode::NO_CONTENT
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_target_refuses_capacity_before_source_is_paused() {
+	let h = harness().await;
+	let id = create(&h).await;
+	let peer = join_peer(&h, PEER, |cap| {
+		cap.resources = Some(vmon_cluster::ResourceCapacity {
+			version: 1,
+			enforcement: "admission".into(),
+			vcpus: 4,
+			memory_mb: 4096,
+			overhead_mb: 512,
+			..Default::default()
+		});
+	})
+	.await;
+	peer.fake.lock().migration.refuse_reservation = true;
+	let (status, body) = admin_migrate(&h, &id, Some(json!({"nodeID":PEER.to_string()}))).await;
+	assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+	assert_eq!(h.fake.lock().migration.handovers, Vec::<String>::new());
+	assert_eq!(h.fake.lock().sandboxes[&id].state, NodeState::Running);
+	assert_eq!(peer.fake.lock().migration.reservations.len(), 1);
+	assert_eq!(peer.fake.lock().migration.adopts, Vec::<(String, AdoptSandbox)>::new());
+	peer.cluster.shutdown().await;
+	h.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_target_releases_its_reservation_after_migration() {
+	let h = harness().await;
+	let id = create(&h).await;
+	let peer = join_peer(&h, PEER, |cap| {
+		cap.resources = Some(vmon_cluster::ResourceCapacity {
+			version: 1,
+			enforcement: "cgroup-v2".into(),
+			vcpus: 4,
+			memory_mb: 4096,
+			overhead_mb: 512,
+			..Default::default()
+		});
+	})
+	.await;
+	let (status, body) = admin_migrate(&h, &id, Some(json!({"nodeID":PEER.to_string()}))).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	eventually("target capacity released", || async {
+		!peer.fake.lock().migration.released.is_empty()
+	})
+	.await;
+	{
+		let node = peer.fake.lock();
+		assert_eq!(node.migration.reservations[0].0, id);
+		assert_eq!(node.migration.reservations[0].1.token, node.migration.released[0]);
+	}
+	peer.cluster.shutdown().await;
+	h.finish().await;
 }
 
 /// Copies the source's committed pause into this node's table.

@@ -81,6 +81,7 @@ async fn setup_node(data: PathBuf, cpu_baseline: Option<&str>) -> Env {
 	std::fs::create_dir_all(&data).unwrap();
 	let net = NetManager::new(NetMode::Auto, "172.20.0.0/16", None).unwrap();
 	let vms = VmRuntime::new(VmRuntimeConfig {
+		resources: Default::default(),
 		vmon_bin: path_var("VMON_BIN"),
 		run_dir: PathBuf::from(format!(
 			"/tmp/vbe-{}-{}",

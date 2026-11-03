@@ -462,7 +462,10 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 				return Err(error);
 			},
 		};
-		let guard = state.scheduler.begin(candidate.node_id, plan.gpus);
+		let guard =
+			state
+				.scheduler
+				.begin(candidate.node_id, plan.gpus, placement.vcpus, placement.memory_mb);
 		match client.create_sandbox(&request).await {
 			Ok(info) => {
 				guard.finish(CreateOutcome::Success);
