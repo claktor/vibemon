@@ -1550,9 +1550,11 @@ per sandbox after a failure), the
 **reconciler** (every 10 s, in its own task so a pass stalled on the store never
 delays the reaper; a sandbox whose repair fails is logged and retried next
 pass: compare node `GET /sandboxes` with KV routes; routes
-of `Dead` nodes, and of `Left` nodes that have not rejoined within 60 s — a
-gracefully restarted node keeps its VMMs and adopts them — → store `killed` +
-events; an unlocked running route older than 2 min whose VM its alive node
+of nodes continuously `Dead` or missing from gossip for 2 min, and of `Left`
+nodes that have not rejoined within 60 s, are removed and marked `killed` in
+the store with events. Each leader tracks unavailability from its first
+observation; `Alive` or `Suspect` resets the grace. Temporary partitions keep
+their routes, and gracefully restarted nodes can adopt their VMMs; an unlocked running route older than 2 min whose VM its alive node
 does not list counts as lost too (younger ones may still be booting even if
 their create lock lapsed); running rows without a route, unlocked and
 started over 2 min ago, are marked killed; VMMs a node reports without a route on that node are killed, except

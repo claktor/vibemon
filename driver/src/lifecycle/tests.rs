@@ -747,6 +747,38 @@ async fn resumes_the_node_completed_despite_an_error_keep_the_sandbox() {
 	h.finish().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_temporarily_missing_node_keeps_its_route_and_running_vm() {
+	let h = harness().await;
+	let (status, created) = h.create().await;
+	assert_eq!(status, StatusCode::CREATED, "{created}");
+	let id = created["sandboxID"].as_str().unwrap().to_owned();
+	let mut departures = super::background::Departures::default();
+
+	for node_role in [false, true] {
+		h.cluster.update_meta(|meta| meta.roles.node = node_role);
+		eventually("node membership changed", || async {
+			h.cluster
+				.members()
+				.iter()
+				.any(|(member, meta)| member.id == h.cluster.local_id() && meta.roles.node == node_role)
+		})
+		.await;
+		super::background::reconcile(&h.state, &mut departures)
+			.await
+			.unwrap();
+		assert!(get_route(&h.cluster.kv, &id).await.unwrap().is_some());
+		assert_eq!(
+			h.state.store.sandbox(&id).await.unwrap().unwrap().state(),
+			crate::store::sandboxes::SandboxState::Running
+		);
+		assert_eq!(h.fake.lock().kills, Vec::<String>::new());
+		assert_eq!(h.fake.lock().sandboxes[&id].state, NodeState::Running);
+	}
+	h.kill(&id).await;
+	h.finish().await;
+}
+
 /// Regression (raft commits stalled by disk I/O): a create's sandbox lock
 /// lapsed while the node was still booting the VM, and the reconciler, seeing
 /// an unlocked running route whose VM the node did not list yet, removed the

@@ -41,44 +41,50 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const ORPHAN_GRACE_MS: u64 = 120_000;
 /// How long routes on a node that left gossip gracefully survive: `vmon
 /// serve` shutdown leaves the VMMs running for the restarted node to adopt
-/// (ARCHITECTURE.md §8.2), so a restart must not kill its sandboxes. `Dead`
-/// (crashed or unreachable) nodes lose their routes immediately.
+/// (ARCHITECTURE.md §8.2), so a restart must not kill its sandboxes.
 const LEFT_NODE_GRACE: Duration = Duration::from_mins(1);
+/// Gossip failure detection cannot distinguish a crash from a temporary
+/// partition.
+const UNREACHABLE_NODE_GRACE: Duration = Duration::from_mins(2);
 
-/// When this leader first saw each node in gossip state `Left`.
+/// When this leader first saw each routed node unavailable.
 #[derive(Debug, Default)]
 pub struct Departures {
-	left_since: HashMap<NodeId, Instant>,
+	unavailable_since: HashMap<NodeId, Instant>,
 }
 
 impl Departures {
-	/// Records `Left` nodes (first sighting wins) and forgets the others.
-	fn observe(&mut self, states: impl IntoIterator<Item = (NodeId, MemberState)>, now: Instant) {
-		let left: HashSet<NodeId> = states
+	fn observe(
+		&mut self,
+		states: impl IntoIterator<Item = (NodeId, Option<MemberState>)>,
+		now: Instant,
+	) {
+		let unavailable: HashSet<NodeId> = states
 			.into_iter()
-			.filter(|(_, state)| *state == MemberState::Left)
+			.filter(|(_, state)| !matches!(state, Some(MemberState::Alive | MemberState::Suspect)))
 			.map(|(id, _)| id)
 			.collect();
-		self.left_since.retain(|id, _| left.contains(id));
-		for id in left {
-			self.left_since.entry(id).or_insert(now);
+		self
+			.unavailable_since
+			.retain(|id, _| unavailable.contains(id));
+		for id in unavailable {
+			self.unavailable_since.entry(id).or_insert(now);
 		}
 	}
 
-	/// How long `node` has been seen `Left` (zero when it is not).
-	fn left_for(&self, node: NodeId, now: Instant) -> Duration {
+	fn unavailable_for(&self, node: NodeId, now: Instant) -> Duration {
 		self
-			.left_since
+			.unavailable_since
 			.get(&node)
 			.map_or(Duration::ZERO, |since| now - *since)
 	}
 }
 
 /// Whether routes on a node that is not `Alive` count as lost.
-fn node_lost(state: Option<MemberState>, left_for: Duration) -> bool {
+fn node_lost(state: Option<MemberState>, unavailable_for: Duration) -> bool {
 	match state {
-		None | Some(MemberState::Dead) => true,
-		Some(MemberState::Left) => left_for >= LEFT_NODE_GRACE,
+		None | Some(MemberState::Dead) => unavailable_for >= UNREACHABLE_NODE_GRACE,
+		Some(MemberState::Left) => unavailable_for >= LEFT_NODE_GRACE,
 		Some(MemberState::Alive | MemberState::Suspect) => false,
 	}
 }
@@ -140,7 +146,9 @@ async fn run_reconciler(state: AppState) {
 	let mut departures = Departures::default();
 	let mut ticks = LeaderTicks::new(&state, RECONCILE_INTERVAL);
 	while let Some(is_leader) = ticks.tick().await {
-		if is_leader && let Err(error) = reconcile(&state, &mut departures).await {
+		if !is_leader {
+			departures = Departures::default();
+		} else if let Err(error) = reconcile(&state, &mut departures).await {
 			tracing::warn!(error = %error.message, "sandbox reconciliation failed");
 		}
 	}
@@ -184,14 +192,6 @@ pub async fn reconcile(state: &AppState, departures: &mut Departures) -> ApiResu
 		.filter(|(_, meta)| meta.roles.node)
 		.map(|(member, meta)| (member.id, (member.state, meta.cluster_url(&member))))
 		.collect();
-	let now_instant = Instant::now();
-	departures.observe(
-		members
-			.iter()
-			.map(|(id, (member_state, _))| (*id, *member_state)),
-		now_instant,
-	);
-
 	// Inventories first, routes second: a route is always written before its
 	// VM exists, so every listed VM's route is visible to the later read.
 	let inventories = futures::future::join_all(
@@ -210,6 +210,18 @@ pub async fn reconcile(state: &AppState, departures: &mut Departures) -> ApiResu
 	.await;
 	let inventories: HashMap<NodeId, Vec<SandboxInfo>> = inventories.into_iter().flatten().collect();
 	let routes = list_routes(kv).await?;
+	let now_instant = Instant::now();
+	departures.observe(
+		routes.iter().map(|(_, route)| {
+			(
+				route.node_id,
+				members
+					.get(&route.node_id)
+					.map(|(member_state, _)| *member_state),
+			)
+		}),
+		now_instant,
+	);
 	let routed: HashMap<&str, NodeId> = routes
 		.iter()
 		.map(|(id, route)| (id.as_str(), route.node_id))
@@ -240,7 +252,7 @@ pub async fn reconcile(state: &AppState, departures: &mut Departures) -> ApiResu
 				},
 				other => node_lost(
 					other.map(|(member_state, _)| *member_state),
-					departures.left_for(route.node_id, now_instant),
+					departures.unavailable_for(route.node_id, now_instant),
 				),
 			};
 			if gone {
@@ -408,29 +420,45 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn left_nodes_keep_routes_through_a_restart_but_dead_nodes_do_not() {
-		let (a, b) = (NodeId(1), NodeId(2));
+	fn unavailable_routes_survive_until_their_grace_expires() {
+		let node = NodeId(1);
 		let t0 = Instant::now();
-		let mut departures = Departures::default();
-		departures.observe([(a, MemberState::Left), (b, MemberState::Dead)], t0);
-		let soon = t0 + Duration::from_secs(5);
-		departures.observe([(a, MemberState::Left), (b, MemberState::Dead)], soon);
-		assert_eq!(departures.left_for(a, soon), Duration::from_secs(5), "first sighting wins");
-		assert!(!node_lost(Some(MemberState::Left), departures.left_for(a, soon)));
-		assert!(node_lost(Some(MemberState::Dead), departures.left_for(b, soon)));
-		assert!(node_lost(None, Duration::ZERO), "unknown node");
-		assert!(!node_lost(Some(MemberState::Suspect), Duration::ZERO));
+		for (state, grace) in [
+			(Some(MemberState::Left), LEFT_NODE_GRACE),
+			(Some(MemberState::Dead), UNREACHABLE_NODE_GRACE),
+			(None, UNREACHABLE_NODE_GRACE),
+		] {
+			let mut departures = Departures::default();
+			departures.observe([(node, state)], t0);
+			let elapsed = grace.checked_sub(Duration::from_millis(1)).unwrap();
+			let before = t0 + elapsed;
+			departures.observe([(node, state)], before);
+			assert_eq!(departures.unavailable_for(node, before), elapsed);
+			assert!(!node_lost(state, departures.unavailable_for(node, before)));
+			assert!(node_lost(state, departures.unavailable_for(node, t0 + grace)));
+		}
+	}
 
-		let late = t0 + LEFT_NODE_GRACE;
-		assert!(node_lost(Some(MemberState::Left), departures.left_for(a, late)), "never came back");
-
-		// The node restarts (Alive again), then leaves once more: a fresh grace.
-		departures.observe([(a, MemberState::Alive)], late);
-		assert_eq!(departures.left_for(a, late), Duration::ZERO);
-		departures.observe([(a, MemberState::Left)], late);
-		assert!(!node_lost(
-			Some(MemberState::Left),
-			departures.left_for(a, late + Duration::from_secs(1))
-		));
+	#[test]
+	fn recovery_resets_the_grace_but_missing_members_do_not() {
+		let node = NodeId(1);
+		let t0 = Instant::now();
+		for recovered in [MemberState::Alive, MemberState::Suspect] {
+			let mut departures = Departures::default();
+			departures.observe([(node, Some(MemberState::Dead))], t0);
+			let later = t0 + Duration::from_secs(30);
+			departures.observe([(node, None)], later);
+			assert_eq!(departures.unavailable_for(node, later), Duration::from_secs(30));
+			departures.observe([(node, Some(recovered))], later);
+			assert_eq!(departures.unavailable_for(node, later), Duration::ZERO);
+			assert!(!node_lost(Some(recovered), UNREACHABLE_NODE_GRACE));
+			departures.observe([(node, Some(MemberState::Dead))], later);
+			assert!(!node_lost(
+				Some(MemberState::Dead),
+				departures.unavailable_for(node, t0 + UNREACHABLE_NODE_GRACE)
+			));
+			departures.observe([], later);
+			assert_eq!(departures.unavailable_for(node, later), Duration::ZERO);
+		}
 	}
 }
