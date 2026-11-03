@@ -605,18 +605,36 @@ mod tests {
 		assert!(!cache.contains("a") && cache.contains("c"), "unpinned, it is evicted again");
 	}
 
-	#[tokio::test]
-	async fn abandoned_store_finishes_and_cleans_up() {
+	#[test]
+	fn abandoned_store_finishes_and_cleans_up() {
+		tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.max_blocking_threads(1)
+			.build()
+			.unwrap()
+			.block_on(abandoned_store());
+	}
+
+	async fn abandoned_store() {
 		let dir = tempfile::tempdir().unwrap();
 		let cache = StepCache::new(dir.path().join("steps"), u64::MAX).unwrap();
 		let rootfs = dir.path().join("rootfs");
 		std::fs::write(&rootfs, vec![7u8; 4 << 20]).unwrap();
+		let (ready, started) = tokio::sync::oneshot::channel();
+		let (release, blocked) = std::sync::mpsc::channel::<()>();
+		let blocker = tokio::task::spawn_blocking(move || {
+			let _ = ready.send(());
+			let _ = blocked.recv();
+		});
+		started.await.unwrap();
 		// A cancelled build drops the store future after its first poll.
 		let dropped = tokio::time::timeout(
 			std::time::Duration::ZERO,
 			cache.store("k", &rootfs, &BuildContext::default(), CopyPolicy::Always),
 		)
 		.await;
+		drop(release);
+		blocker.await.unwrap();
 		assert!(dropped.is_err(), "the store was abandoned midway");
 		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 		let names = || -> Vec<String> {

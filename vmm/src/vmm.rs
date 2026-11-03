@@ -112,7 +112,8 @@ const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1 earlycon=uart8250
 /// feature needs 4 KiB file-backed RAM: KSM merges small anonymous pages, the
 /// zram/remote pagers own the memory's userfaultfd, and VFIO pins all of it.
 const fn huge_ram_eligible(config: &Config) -> bool {
-	!config.ksm
+	!config.no_hugepages
+		&& !config.ksm
 		&& config.mem_target_mib.is_none()
 		&& config.remote_page_url.is_none()
 		&& config.vfio_gpus.is_empty()
@@ -1675,6 +1676,9 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 		// The binary is the multiplexed `vmon`; fork children re-enter the
 		// per-VM monitor through its `vmm` subcommand.
 		cmd.arg("vmm");
+		if config.no_hugepages {
+			cmd.arg("--no-hugepages");
+		}
 		cmd.arg("--fork-from").arg(dir).arg("--count").arg("1");
 		// Only attach networking to a clone when the snapshot actually has a net
 		// device (or the operator forced user-net); a no-net snapshot's clone
@@ -4904,6 +4908,13 @@ mod backend_restore_tests {
 				.map(str::to_owned),
 		)
 		.expect("restore config")
+	}
+	#[test]
+	fn managed_memory_disables_explicit_hugetlb_backing() {
+		assert!(huge_ram_eligible(&config(&[])));
+		let bounded = config(&["--no-hugepages"]);
+		assert!(bounded.no_hugepages);
+		assert!(!huge_ram_eligible(&bounded));
 	}
 	#[test]
 	fn restored_remote_block_keeps_remote_base_instead_of_serving_sparse_holes() {

@@ -56,6 +56,47 @@ const EVACUATE_PER_NODE: usize = 2;
 /// How long the evacuator leaves a sandbox alone after a failed migration.
 const EVACUATE_BACKOFF: Duration = Duration::from_mins(1);
 
+async fn reserve_target(
+	state: &AppState,
+	target: NodeId,
+	row: &SandboxRow,
+) -> ApiResult<Option<tokio::sync::oneshot::Sender<()>>> {
+	if !state
+		.node_members()
+		.iter()
+		.any(|(id, meta)| *id == target && meta.node.as_ref().is_some_and(|c| c.resources.is_some()))
+	{
+		return Ok(None);
+	}
+	let client = state.node(target)?;
+	let id = row.id.clone();
+	let request = vmon_node::api::ReserveSandbox {
+		token:     uuid::Uuid::new_v4().to_string(),
+		vcpus:     row.vcpus,
+		memory_mb: row.memory_mb,
+	};
+	client
+		.reserve_sandbox(&id, &request)
+		.await
+		.map_err(|error| {
+			ApiError::unavailable(format!("migration target cannot reserve capacity: {error}"))
+				.with_code("sandbox_capacity_unavailable")
+		})?;
+	let (done, mut stopped) = tokio::sync::oneshot::channel();
+	tokio::spawn(async move {
+		loop {
+			tokio::select! {
+				_ = &mut stopped => break,
+				() = tokio::time::sleep(Duration::from_secs(15)) => {
+					if let Err(error) = client.reserve_sandbox(&id, &request).await { tracing::warn!(sandbox = id, %error, "renewing migration reservation failed"); }
+				},
+			}
+		}
+		let _ = client.release_reservation(&id, &request.token).await;
+	});
+	Ok(Some(done))
+}
+
 /// Where a migrated sandbox lives now ([`migrate`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Migrated {
@@ -193,6 +234,7 @@ async fn migrate_running(
 	let (target, holders) = choose_target(state, source, row, &policy, requested).await?;
 	let source_client = state.node(source)?;
 	let target_client = state.node(target)?;
+	let _target_reservation = reserve_target(state, target, row).await?;
 	// Everything the target needs exists before the sandbox stops. Deadline
 	// changes take the sandbox lock, so the route's stays current throughout.
 	let end = route.end_at_ms;
@@ -312,6 +354,7 @@ async fn migrate_paused(
 	let (target, holders) = choose_target(state, source, row, &policy, requested).await?;
 	let source_client = state.node(source)?;
 	let target_client = state.node(target)?;
+	let _target_reservation = reserve_target(state, target, row).await?;
 	let adopt = adopt_request(state, row, policy, unix_ms(row.end_at), source, &holders);
 	tracing::info!(sandbox = id, from = %source, to = %target, "migrating paused sandbox");
 	if let Err(error) = target_client.adopt_sandbox(id, &adopt).await {

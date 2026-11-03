@@ -115,8 +115,16 @@ impl std::error::Error for ApiError {}
 
 impl IntoResponse for ApiError {
 	fn into_response(self) -> Response {
-		(self.status, Json(ErrorBody { code: self.code.to_owned(), message: self.message }))
-			.into_response()
+		let busy = self.code == "busy";
+		let mut response =
+			(self.status, Json(ErrorBody { code: self.code.to_owned(), message: self.message }))
+				.into_response();
+		if busy {
+			response
+				.headers_mut()
+				.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("5"));
+		}
+		response
 	}
 }
 
@@ -180,6 +188,8 @@ pub fn sandbox_routes(manager: Arc<SandboxManager>, peers: Peers) -> Router {
 		.route("/sandboxes/{id}/pause", post(pause))
 		.route("/sandboxes/{id}/resume", post(resume))
 		.route("/sandboxes/{id}/adopt", post(adopt))
+		.route("/sandboxes/{id}/reservation", post(reserve_sandbox))
+		.route("/sandboxes/{id}/reservation/{token}", delete(release_reservation))
 		.route("/sandboxes/{id}/paused", delete(drop_paused))
 		.route("/sandboxes/{id}/handover", get(handover_manifest))
 		.route("/sandboxes/{id}/handover/{*path}", get(handover_file))
@@ -262,6 +272,23 @@ async fn adopt(
 	let adopted =
 		detached(async move { manager.adopt_paused(&id, req.meta, &source, &sources).await });
 	Ok(Json(adopted.await?))
+}
+
+async fn reserve_sandbox(
+	State(manager): Manager,
+	Path(id): Path<String>,
+	Json(req): Json<crate::api::ReserveSandbox>,
+) -> Result<StatusCode, ApiError> {
+	manager.reserve_migration(&id, req)?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+async fn release_reservation(
+	State(manager): Manager,
+	Path((id, token)): Path<(String, String)>,
+) -> StatusCode {
+	manager.release_migration(&id, &token);
+	StatusCode::NO_CONTENT
 }
 
 async fn drop_paused(

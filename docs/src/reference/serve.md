@@ -162,6 +162,17 @@ These flags apply to the node role.
 | `--max-vcpus <MAX_VCPUS>` | `VMON_MAX_VCPUS` | host CPUs | vCPUs offered to sandboxes, as advertised in gossip. Placement admits allocated vCPUs up to 4× this value. |
 | `--max-memory-mb <MAX_MEMORY_MB>` | `VMON_MAX_MEMORY_MB` | host memory | Memory offered to sandboxes in MiB. Placement admits allocated guest memory up to 2× this value. |
 | `--hugepage-pool-mb <HUGEPAGE_POOL_MB>` | `VMON_HUGEPAGE_POOL_MB` | `0` | Linux, node role: at startup, write `<value> / 2` to `/proc/sys/vm/nr_hugepages`, which reserves that many MiB of 2 MiB hugetlb pages for sandbox RAM restored from snapshots (create, resume, fork). `0` leaves the host setting alone. |
+| `--resource-policy` | `VMON_RESOURCE_POLICY` | `legacy` | `strict`: admission plus delegated Linux cgroup v2 enforcement. `reserved`: admission on Linux/macOS without a kernel usage ceiling. |
+| `--resource-vcpus` | `VMON_RESOURCE_VCPUS` | `0` | Positive aggregate workload vCPU budget required by bounded policies; no overcommit. |
+| `--resource-memory-mb` | `VMON_RESOURCE_MEMORY_MB` | `0` | Aggregate workload reservation budget in MiB, including overhead. |
+| `--resource-overhead-mb` | `VMON_RESOURCE_OVERHEAD_MB` | `512` | Positive host overhead added to each VM's full guest RAM. |
+| `--resource-host-reserve-mb` | `VMON_RESOURCE_HOST_RESERVE_MB` | `4096` | Available host memory to preserve after outstanding commitments. |
+| `--resource-hysteresis-mb` | `VMON_RESOURCE_HYSTERESIS_MB` | `1024` | Additional available memory required to reopen admission after pressure. |
+| `--resource-cgroup` | `VMON_RESOURCE_CGROUP` | current service | Strict policy's delegated cgroup root. The node must already run there or in its `manager` subgroup. |
+
+Bounded policies use one concurrent boot and one template build. They reject
+legacy capacity overrides, concurrency above one, and explicit hugepage pool
+configuration. See [Node resource budgets](../operate/serve.md#node-resource-budgets).
 
 The hugepage write sets the absolute size of the host pool; it does not add to the current size. It needs root. The kernel can grant fewer pages than requested when contiguous memory is short. vmon logs the result either way. On other platforms a non-zero value logs a warning and is otherwise ignored. For the trade-offs, see [Hugepages](../operate/serve.md#hugepages).
 

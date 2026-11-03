@@ -116,6 +116,71 @@ pub struct NodeCapacity {
 	pub cached_builds:  Vec<String>,
 	/// GPUs found on the host, assignable or not.
 	pub gpus:           Vec<GpuInfo>,
+	/// Versioned node-local budget. Absent on legacy nodes.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub resources:      Option<ResourceCapacity>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceCapacity {
+	pub version:            u32,
+	pub enforcement:        String,
+	pub vcpus:              u32,
+	pub memory_mb:          u64,
+	pub reserved_vcpus:     u64,
+	pub reserved_memory_mb: u64,
+	pub overhead_mb:        u64,
+	pub pending:            u32,
+	pub actual_memory_mb:   Option<u64>,
+	pub host_available_mb:  u64,
+	pub memory_limit_mb:    Option<u64>,
+	pub cpu_limit_millis:   Option<u64>,
+	pub admission_reason:   Option<String>,
+}
+
+impl ResourceCapacity {
+	pub fn fits(&self, vcpus: u64, memory_mb: u64, instances: u64) -> bool {
+		self.version == 1
+			&& self.admission_reason.is_none()
+			&& self.reserved_vcpus.saturating_add(vcpus) <= u64::from(self.vcpus)
+			&& self
+				.reserved_memory_mb
+				.saturating_add(memory_mb)
+				.saturating_add(self.overhead_mb.saturating_mul(instances))
+				<= self.memory_mb
+	}
+}
+
+#[cfg(test)]
+mod resource_tests {
+	use super::*;
+
+	#[test]
+	fn capacity_decodes_legacy_and_roundtrips_bounded_nodes() {
+		let legacy = serde_json::to_value(NodeCapacity::default()).unwrap();
+		assert!(legacy.get("resources").is_none());
+		assert!(
+			serde_json::from_value::<NodeCapacity>(legacy)
+				.unwrap()
+				.resources
+				.is_none()
+		);
+		let bounded = NodeCapacity {
+			resources: Some(ResourceCapacity {
+				version: 1,
+				enforcement: "admission".into(),
+				vcpus: 6,
+				memory_mb: 16384,
+				..Default::default()
+			}),
+			..Default::default()
+		};
+		assert_eq!(
+			serde_json::from_slice::<NodeCapacity>(&serde_json::to_vec(&bounded).unwrap()).unwrap(),
+			bounded
+		);
+	}
 }
 
 /// One host GPU as published in [`NodeCapacity::gpus`]; the scheduler counts

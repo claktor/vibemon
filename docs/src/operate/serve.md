@@ -105,6 +105,7 @@ Under systemd, set `KillMode=process` in the unit (or a drop-in). The default `K
 # /etc/systemd/system/vmon.service.d/killmode.conf
 [Service]
 KillMode=process
+OOMPolicy=continue
 ```
 
 A node restarted with SIGTERM can adopt its surviving VMMs when it comes back within the leader's 60 s grace period for `Left` nodes. On Linux, a sandbox with lazily restored memory loses its node-local page server and fails its next remote page fault after restart. A node that dies without leaving (SIGKILL, crash, network loss) goes `Dead`, and its sandboxes are marked killed. See [Failure handling](cluster.md#failure-handling).
@@ -130,6 +131,85 @@ A node advertises its capacity in gossip, and drivers place sandboxes from it:
 | `--step-cache-mb` (default `0` = 10% of the data directory's filesystem) | Disk kept for cached build layers; least recently used layers are evicted beyond it. |
 
 When no node has room, creates fail with 503 `sandbox_capacity_unavailable`. When no node matches the request's architecture, features, or pin, they fail with 503 `sandbox_no_compatible_node`. Per-team quotas are separate; see [Authentication and teams](../concepts/auth.md#limits). Lower `--max-vcpus` and `--max-memory-mb` to reserve host resources for other workloads.
+
+## Node resource budgets
+
+The default `legacy` policy preserves scheduler-only capacity hints and the
+4× vCPU / 2× memory overcommit factors. For a shared workstation, select a
+bounded policy explicitly:
+
+```sh
+vmon serve --role node --resource-policy reserved \
+  --resource-vcpus 6 --resource-memory-mb 16384 \
+  --resource-overhead-mb 512 --resource-host-reserve-mb 4096
+```
+
+`reserved` works on Apple Silicon macOS and Linux. Every pending or running
+VM reserves its full guest RAM plus overhead, and its vCPUs, with no
+overcommit. This includes forks, resumes, migration targets and build VMs.
+Builds reserve their largest phase up front. Snapshot sizes are checked
+again at launch. Capacity exhaustion returns `busy`; clients can retry.
+One boot and one build run at a time. Increase the overhead allowance if
+measurements show that the defaults are insufficient for your workloads.
+
+**macOS reservation caps are not hard host usage limits.** They limit guest
+allocations, not aggregate CPU time or all host allocations. Admission
+also stops on macOS memory pressure or insufficient estimated reclaimable
+memory. The estimate uses free pages plus inactive pages bounded by file
+pages; outstanding reservations are conservatively subtracted in full.
+The dashboard labels this mode “Reservation caps” and does not invent an
+actual aggregate memory reading. `strict` fails on macOS rather than
+silently weakening its guarantee.
+
+On Linux, `strict` also requires cgroup v2 CPU, memory and PID delegation,
+finite ancestor CPU/RAM limits, `memory.high` below `memory.max`, and swap
+disabled. For a combined driver/node service, a systemd unit can use:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/vmon serve --role node,driver --resource-policy strict --resource-vcpus 6 --resource-memory-mb 16384 --resource-host-reserve-mb 12288
+Delegate=cpu memory pids
+DelegateSubgroup=manager
+MemoryHigh=18G
+MemoryMax=20G
+MemorySwapMax=0
+CPUQuota=800%
+KillMode=process
+OOMPolicy=continue
+```
+
+Keep the existing service's identity, credentials, storage and network
+options. `DelegateSubgroup` requires systemd 254 or newer; without it vmon
+can move itself to `manager` when it is the delegated root's only process.
+The parent contains the manager, helpers and all VM cgroups. The workload
+subtree has the 16 GiB / 6 CPU limit; the remaining parent budget is for
+control work and host overhead. Separate driver/worker services need a
+common capped slice and a smaller worker ceiling. Builds of vmon itself or
+the guest kernel must run in a separately limited service or inside that
+same aggregate slice.
+
+VMMs enter their workload cgroup before exec. Each workload has memory,
+CPU and PID limits; OOM grouping is confined to that workload. Explicit
+hugetlb allocation is disabled even if the host has an existing pool;
+transparent huge pages remain available. Hitting `memory.max` can kill the
+offending workload. CPU quotas limit aggregate time, not exclusive cores.
+
+Reservations live under `<data-dir>/resources`. Inherited file locks keep
+them charged until VMMs exit, including failed starts, cancellation and
+node restarts. Keep that directory and the cgroup hierarchy on restart;
+do not use a service stop action that kills all child processes. One
+bounded node per host user is allowed. Drain legacy VMs before enabling
+caps, and drain before shrinking live limits. External cap changes or
+unaccounted live VMs close admission. A 60-second renewable migration
+reservation is acquired on the target before the source is paused.
+
+`GET /nodes` membership metadata includes versioned `resources`: reserved,
+pending and configured capacity, enforcement mode, admission reason and,
+on strict Linux nodes, cgroup memory usage and effective kernel limits.
+Linux pressure checks preserve the configured host reserve after pending
+commitments; memory PSI of at least 1% over ten seconds closes admission.
+The memory recovery margin avoids repeatedly reopening at the threshold.
+These controls do not cap disk capacity, network traffic or I/O bandwidth.
 
 ## Hugepages
 

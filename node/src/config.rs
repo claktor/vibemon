@@ -18,6 +18,7 @@ pub struct CapacityOverrides {
 /// the documented fallback.
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
+	pub resources:               crate::resources::ResourceConfig,
 	/// Durable node state (`builds/`, `sandboxes/`, `paused/`, `files/`, …).
 	pub data_dir:                PathBuf,
 	/// Short directory for per-VM Unix sockets (see [`default_run_dir`]).

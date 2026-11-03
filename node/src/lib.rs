@@ -25,6 +25,7 @@ pub mod metrics;
 pub mod net;
 pub mod oci;
 pub mod paused_store;
+pub mod resources;
 pub mod s3fs;
 pub mod sandbox;
 pub mod server;
@@ -70,6 +71,7 @@ impl Node {
 	pub async fn start(config: NodeConfig, cluster: Cluster) -> anyhow::Result<Self> {
 		std::fs::create_dir_all(&config.data_dir)
 			.with_context(|| format!("creating {}", config.data_dir.display()))?;
+		let resources = resources::Resources::open(config.resources.clone(), &config.data_dir)?;
 		let http = reqwest::Client::builder()
 			.connect_timeout(Duration::from_secs(5))
 			.build()
@@ -99,12 +101,15 @@ impl Node {
 			(true, None) => VmmIsolation::Disabled,
 			(false, _) => VmmIsolation::Default,
 		};
-		let boot_concurrency = if config.boot_concurrency == 0 {
+		let boot_concurrency = if resources.bounded() {
+			1
+		} else if config.boot_concurrency == 0 {
 			4 * host::cpus() as usize
 		} else {
 			config.boot_concurrency
 		};
 		let vms = VmRuntime::new(VmRuntimeConfig {
+			resources: resources.clone(),
 			vmon_bin: config.vmon_bin.clone(),
 			run_dir: config.run_dir.clone(),
 			boot_concurrency,
@@ -130,7 +135,9 @@ impl Node {
 				envd_version: envd_version.clone(),
 				kernel: kernel.clone(),
 				agent_binary: agent,
-				max_parallel: if config.max_parallel_builds == 0 {
+				max_parallel: if resources.bounded() {
+					1
+				} else if config.max_parallel_builds == 0 {
 					2
 				} else {
 					config.max_parallel_builds
@@ -235,6 +242,7 @@ impl Node {
 				loop {
 					ticker.tick().await;
 					let usage = sandboxes.usage();
+					let budget = resources.capacity();
 					// Sysfs reads (GPU discovery) stay off the async workers.
 					let host_gpus = {
 						let gpus = Arc::clone(&gpus);
@@ -248,8 +256,13 @@ impl Node {
 						os:             host::os().to_owned(),
 						cpu_model:      cpu_model.clone(),
 						cpu_baseline:   cpu_baseline.clone(),
-						cpus:           overrides.cpus.unwrap_or_else(host::cpus),
-						memory_mb:      overrides.memory_mb.unwrap_or_else(host::memory_mb),
+						cpus:           budget
+							.as_ref()
+							.map_or_else(|| overrides.cpus.unwrap_or_else(host::cpus), |b| b.vcpus),
+						memory_mb:      budget.as_ref().map_or_else(
+							|| overrides.memory_mb.unwrap_or_else(host::memory_mb),
+							|b| b.memory_mb,
+						),
 						disk_free_mb:   host::disk_free_mb(&data_dir),
 						vcpus_used:     usage.vcpus,
 						memory_used_mb: usage.memory_mb,
@@ -259,6 +272,7 @@ impl Node {
 						features:       features.clone(),
 						cached_builds:  builder.artifacts().cached_builds(),
 						gpus:           host_gpus,
+						resources:      budget,
 					};
 					cluster.update_meta(|meta| {
 						let draining = meta.node.as_ref().is_some_and(|node| node.draining);

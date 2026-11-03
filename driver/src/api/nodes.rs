@@ -76,6 +76,8 @@ struct NodeMetrics {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NodeDto {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	resources:              Option<vmon_cluster::ResourceCapacity>,
 	version:                String,
 	commit:                 String,
 	id:                     String,
@@ -145,6 +147,7 @@ struct MemberDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MemberNodeDto {
+	resources:        Option<vmon_cluster::ResourceCapacity>,
 	status:           &'static str,
 	arch:             String,
 	os:               String,
@@ -197,8 +200,15 @@ fn node_dto(
 	cluster_id: &str,
 ) -> NodeDto {
 	let cap = meta.node.clone().unwrap_or_default();
-	let max_sandboxes = (cap.memory_mb * MEMORY_OVERCOMMIT) / NOMINAL_SANDBOX_MEMORY_MB;
+	let max_sandboxes = cap.resources.as_ref().map_or_else(
+		|| cap.memory_mb.saturating_mul(MEMORY_OVERCOMMIT) / NOMINAL_SANDBOX_MEMORY_MB,
+		|b| {
+			(b.memory_mb / NOMINAL_SANDBOX_MEMORY_MB.saturating_add(b.overhead_mb))
+				.min(u64::from(b.vcpus))
+		},
+	);
 	NodeDto {
+		resources:              cap.resources.clone(),
 		version:                meta.version.clone(),
 		commit:                 meta.version.clone(),
 		id:                     id.to_string(),
@@ -280,6 +290,7 @@ fn member_dto(
 			create_fails:     counters.fails,
 			inflight:         counters.inflight,
 			gpus:             cap.gpus.clone(),
+			resources:        cap.resources.clone(),
 		});
 	let cluster_url = meta.cluster_url(member);
 	MemberDto {

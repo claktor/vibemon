@@ -9,6 +9,7 @@
 //! Environment: `VMON_BIN` (signed `vmon` with the `vmm` subcommand),
 //! `VMON_KERNEL` (guest kernel), `VMON_TEST_ROOTFS` (ext4 with the agent),
 //! `VMON_AGENT` (static guest agent, for the builder config).
+//! `VMON_E2E_RESOURCE_BUDGET=1` tests reservation caps with 4 vCPUs / 8 GiB.
 
 use std::{
 	collections::BTreeMap,
@@ -33,6 +34,7 @@ use vmon_node::{
 	envd::EnvdClient,
 	host,
 	net::{NetManager, NetMode},
+	resources::{ResourceConfig, ResourcePolicy, Resources},
 	sandbox::{ManagerConfig, SandboxManager},
 	server,
 	vm::{Boot, Disk, VmRuntime, VmRuntimeConfig, VmSpec, VmmIsolation},
@@ -79,14 +81,28 @@ async fn health_via_tunnel(client: &NodeClient, id: &str) -> u16 {
 	status
 }
 
+async fn wait_for_reservations(resources: &Resources, vcpus: u64) {
+	tokio::time::timeout(Duration::from_secs(10), async {
+		while resources
+			.capacity()
+			.is_some_and(|c| c.reserved_vcpus != vcpus)
+		{
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	})
+	.await
+	.expect("resource reservations were not released after VM exit");
+}
+
 /// Template build, VM runtime, and node API served over HTTP.
 struct Harness {
-	data:     tempfile::TempDir,
-	run_dir:  PathBuf,
-	build_id: String,
-	manager:  Arc<SandboxManager>,
-	client:   NodeClient,
-	_reaper:  KillOnDrop,
+	resources: Resources,
+	data:      tempfile::TempDir,
+	run_dir:   PathBuf,
+	build_id:  String,
+	manager:   Arc<SandboxManager>,
+	client:    NodeClient,
+	_reaper:   KillOnDrop,
 }
 
 impl Drop for Harness {
@@ -125,9 +141,27 @@ async fn harness(boot_concurrency: usize, template_load: Option<&str>) -> Harnes
 	let run_dir = PathBuf::from(format!("/tmp/vmon-e2e-{}", std::process::id()));
 	let arch = vmon_node::assets::host_arch().to_owned();
 	let cpu_baseline = host::cpu_baseline(&vmon_bin).await.expect("cpu baseline");
+	let resources = if std::env::var("VMON_E2E_RESOURCE_BUDGET").as_deref() == Ok("1") {
+		Resources::open(
+			ResourceConfig {
+				policy:          ResourcePolicy::Reserved,
+				vcpus:           4,
+				memory_mb:       8192,
+				overhead_mb:     512,
+				host_reserve_mb: 4096,
+				hysteresis_mb:   1024,
+				cgroup:          None,
+			},
+			data.path(),
+		)
+		.unwrap()
+	} else {
+		Resources::default()
+	};
 
 	let net = NetManager::new(NetMode::Auto, "172.20.0.0/16", None).expect("net manager");
 	let vms = VmRuntime::new(VmRuntimeConfig {
+		resources: resources.clone(),
 		vmon_bin: vmon_bin.clone(),
 		run_dir: run_dir.clone(),
 		boot_concurrency,
@@ -307,7 +341,7 @@ async fn harness(boot_concurrency: usize, template_load: Option<&str>) -> Harnes
 	tokio::spawn(async move { axum::serve(listener, router).await });
 	let client = NodeClient::new(&url, SECRET, reqwest::Client::new()).unwrap();
 
-	Harness { data, run_dir, build_id, manager, client, _reaper: reaper }
+	Harness { resources, data, run_dir, build_id, manager, client, _reaper: reaper }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -352,6 +386,25 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 		.await
 		.expect("create sandbox");
 	let create_latency = create.elapsed();
+	if let Some(capacity) = harness.resources.capacity() {
+		assert_eq!(capacity.reserved_vcpus, u64::from(created.vcpus));
+		assert_eq!(capacity.reserved_memory_mb, created.memory_mb + capacity.overhead_mb);
+		let token = uuid::Uuid::new_v4().to_string();
+		let held = "iresourcehold00000001";
+		let request = vmon_node::api::ReserveSandbox {
+			token:     token.clone(),
+			vcpus:     capacity.vcpus - created.vcpus,
+			memory_mb: 1,
+		};
+		client.reserve_sandbox(held, &request).await.unwrap();
+		let error = client
+			.reserve_sandbox("iresourcereject000001", &request)
+			.await
+			.unwrap_err();
+		assert_eq!(error.code(), "busy");
+		client.release_reservation(held, &token).await.unwrap();
+		assert_eq!(harness.resources.capacity().unwrap().reserved_vcpus, capacity.reserved_vcpus);
+	}
 	assert_eq!(created.state, SandboxState::Running);
 	eprintln!("create (fork + net_config + envd /init): {create_latency:?}");
 
@@ -564,6 +617,7 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 	let child_vm = manager.live_vm(&child_id).unwrap();
 	assert_eq!(child_vm.agent().fs_read("/tmp/marker").await.unwrap(), b"before-pause");
 	client.kill_sandbox(&child_id).await.expect("kill child");
+	wait_for_reservations(&harness.resources, u64::from(created.vcpus)).await;
 
 	// Volume mount forces a cold boot of the template rootfs; guest writes
 	// land in the host volume directory.
@@ -635,6 +689,11 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 	while paused.exists() {
 		assert!(Instant::now() < deadline, "paused state of a killed sandbox was not removed");
 		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	wait_for_reservations(&harness.resources, 0).await;
+	if let Some(capacity) = harness.resources.capacity() {
+		assert_eq!(capacity.reserved_vcpus, 0);
+		assert_eq!(capacity.reserved_memory_mb, 0);
 	}
 }
 

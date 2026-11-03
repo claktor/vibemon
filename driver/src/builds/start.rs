@@ -283,7 +283,17 @@ pub async fn start_build(
 		template_version: version,
 	};
 	let mut last_error = None;
-	for (node_id, meta) in candidates.into_iter().take(MAX_START_ATTEMPTS) {
+	for (node_id, meta) in candidates
+		.into_iter()
+		.filter(|(_, meta)| {
+			meta
+				.node
+				.as_ref()
+				.and_then(|cap| cap.resources.as_ref())
+				.is_none_or(|b| b.fits(u64::from(start.vcpus.max(2)), start.memory_mb.max(1024), 1))
+		})
+		.take(MAX_START_ATTEMPTS)
+	{
 		let client = state.node(node_id)?;
 		match client.start_build(&start).await {
 			Ok(()) => {
@@ -465,8 +475,13 @@ pub(super) fn builder_candidates(
 	let eligible: Vec<&(NodeId, MemberMeta)> = members
 		.iter()
 		.filter(|(id, meta)| {
-			meta.node.as_ref().is_some_and(|cap| !cap.draining)
-				&& statuses.get(id).is_none_or(|status| status == "ready")
+			meta.node.as_ref().is_some_and(|cap| {
+				!cap.draining
+					&& cap
+						.resources
+						.as_ref()
+						.is_none_or(|b| b.version == 1 && b.admission_reason.is_none())
+			}) && statuses.get(id).is_none_or(|status| status == "ready")
 		})
 		.collect();
 	let arch = if let Some(arch) = required_arch {
@@ -552,6 +567,7 @@ mod tests {
 			features: vec![],
 			cached_builds: vec![],
 			gpus: vec![],
+			resources: None,
 		};
 		let meta = MemberMeta {
 			roles:         Roles { node: true, driver: false },

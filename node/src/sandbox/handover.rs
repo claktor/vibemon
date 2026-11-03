@@ -470,6 +470,17 @@ impl SandboxManager {
 	pub async fn adopt_paused(
 		self: &Arc<Self>,
 		id: &str,
+		meta: SandboxMeta,
+		source: &str,
+		sources: &[String],
+	) -> Result<SandboxInfo, ApiError> {
+		let reservation = self.operation_reservation(id, meta.vcpus, meta.memory_mb)?;
+		crate::resources::scope(reservation, self.adopt_reserved(id, meta, source, sources)).await
+	}
+
+	async fn adopt_reserved(
+		self: &Arc<Self>,
+		id: &str,
 		mut meta: SandboxMeta,
 		source: &str,
 		sources: &[String],

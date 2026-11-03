@@ -53,7 +53,14 @@ pub fn routes(builder: Builder, peers: Peers) -> Router {
 }
 
 fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
-	(status, Json(ErrorBody { code: code.to_owned(), message: message.into() })).into_response()
+	let mut response =
+		(status, Json(ErrorBody { code: code.to_owned(), message: message.into() })).into_response();
+	if code == "busy" {
+		response
+			.headers_mut()
+			.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("5"));
+	}
+	response
 }
 
 fn internal(error: &anyhow::Error) -> Response {
@@ -81,6 +88,7 @@ async fn start_build(
 	match builder.start(req, sources) {
 		Ok(()) => StatusCode::ACCEPTED.into_response(),
 		Err(StartError::Invalid(message)) => error(StatusCode::BAD_REQUEST, "invalid", message),
+		Err(StartError::Busy(message)) => error(StatusCode::SERVICE_UNAVAILABLE, "busy", message),
 		Err(StartError::Internal(e)) => internal(&e),
 	}
 }

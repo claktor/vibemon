@@ -277,6 +277,15 @@ pub struct AdoptSandbox {
 	pub artifact_sources: Vec<NodeId>,
 }
 
+/// Renewable target reservation before a source sandbox is paused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReserveSandbox {
+	pub token:     String,
+	pub vcpus:     u32,
+	pub memory_mb: u64,
+}
+
 /// `GET /sandboxes/{id}/handover`: a committed paused sandbox as a peer pulls
 /// it (`AdoptSandbox`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

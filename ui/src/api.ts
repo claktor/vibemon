@@ -93,6 +93,7 @@ export type MemberState = "alive" | "suspect" | "dead" | "left";
 export type NodeStatus = "ready" | "draining" | "unhealthy" | "connecting" | "shutting_down";
 
 export interface NodeInfo {
+  resources?: ResourceCapacity | null;
   status: NodeStatus;
   arch: string;
   os: string;
@@ -111,6 +112,22 @@ export interface NodeInfo {
   createFails: number;
   inflight: number;
   gpus: GpuInfo[];
+}
+
+export interface ResourceCapacity {
+  version: number;
+  enforcement: "cgroup-v2" | "admission";
+  vcpus: number;
+  memoryMb: number;
+  reservedVcpus: number;
+  reservedMemoryMb: number;
+  overheadMb: number;
+  pending: number;
+  actualMemoryMb: number | null;
+  hostAvailableMb: number;
+  memoryLimitMb: number | null;
+  cpuLimitMillis: number | null;
+  admissionReason: string | null;
 }
 
 /** One host GPU (or vGPU VF) a node publishes. */

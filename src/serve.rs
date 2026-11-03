@@ -17,7 +17,16 @@ use vmon_driver::{Driver, DriverConfig, TeamLimits, ingress::listener::TlsFiles}
 use vmon_node::{
 	CapacityOverrides, Node, NodeConfig,
 	config::{NetMode, default_data_dir, default_run_dir},
+	resources::{ResourceConfig, ResourcePolicy},
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum ResourcePolicyArg {
+	#[default]
+	Legacy,
+	Strict,
+	Reserved,
+}
 
 /// `--net` values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -125,40 +134,40 @@ pub struct ServeArgs {
 	/// `target/kernel/` of a dev tree, else a pinned cloud-hypervisor kernel
 	/// downloaded into the data dir that lacks netfilter/IPv6/NFS).
 	#[arg(long, env = "VMON_KERNEL")]
-	kernel:                  Option<PathBuf>,
+	kernel: Option<PathBuf>,
 	/// Static guest agent binary (default: `vmon-agent-<arch>` next to vmon).
 	#[arg(long, env = "VMON_AGENT")]
-	agent:                   Option<PathBuf>,
+	agent: Option<PathBuf>,
 	/// Guest NVIDIA driver bundle for GPU sandboxes (default:
 	/// `vmon-nvidia-<arch>/` next to vmon, else `target/kernel/` of a dev tree)
 	#[arg(long, env = "VMON_GPU_DRIVER")]
-	gpu_driver:              Option<PathBuf>,
+	gpu_driver: Option<PathBuf>,
 	/// Guest networking.
 	#[arg(long, env = "VMON_NET", value_enum, default_value_t = NetArg::Auto)]
-	net:                     NetArg,
+	net: NetArg,
 	/// Address pool for Linux TAP leases.
 	#[arg(long, env = "VMON_NET_POOL", default_value = "172.20.0.0/16")]
-	net_pool:                String,
+	net_pool: String,
 	/// Concurrent VM boots (0 = 4 × host CPUs).
 	#[arg(long, env = "VMON_BOOT_CONCURRENCY", default_value_t = 0)]
-	boot_concurrency:        usize,
+	boot_concurrency: usize,
 	/// Concurrent template builds on this node (0 = 2).
 	#[arg(long, env = "VMON_MAX_BUILDS", default_value_t = 0)]
-	max_builds:              usize,
+	max_builds: usize,
 	/// Disk the build step cache may occupy in MiB; least recently used
 	/// layers are evicted beyond it (0 = 10% of the data dir's filesystem).
 	#[arg(long, env = "VMON_STEP_CACHE_MB", default_value_t = 0)]
-	step_cache_mb:           u64,
+	step_cache_mb: u64,
 	/// Disk the CI cache's local archive copies may occupy in MiB; least
 	/// recently used copies are evicted beyond it (0 = 10% of the data dir's
 	/// filesystem).
 	#[arg(long, env = "VMON_CI_CACHE_MB", default_value_t = 0)]
-	ci_cache_mb:             u64,
+	ci_cache_mb: u64,
 	/// Disk the node-local Bazel remote cache of CI jobs may occupy in MiB;
 	/// least recently used entries are evicted beyond it (0 = 5% of the data
 	/// dir's filesystem, at most a fifth of its free space at start).
 	#[arg(long, env = "VMON_CI_BAZEL_CACHE_MB", default_value_t = 0)]
-	ci_bazel_cache_mb:       u64,
+	ci_bazel_cache_mb: u64,
 	/// GitHub results service that CI sandboxes' non-cache Twirp calls
 	/// (artifacts, …) are forwarded to.
 	#[arg(
@@ -166,60 +175,83 @@ pub struct ServeArgs {
 		env = "VMON_CI_RESULTS_UPSTREAM",
 		default_value = vmon_node::ci_cache::DEFAULT_UPSTREAM
 	)]
-	ci_results_upstream:     String,
+	ci_results_upstream: String,
 	/// Linux root only: uid:gid that VMM processes drop to (unset = no privilege
 	/// drop).
 	#[arg(long, env = "VMON_VMM_USER", value_parser = parse_uid_gid)]
-	vmm_user:                Option<(u32, u32)>,
+	vmm_user: Option<(u32, u32)>,
 	/// CIDRs sandboxes may reach despite the always-denied private ranges (comma
 	/// separated).
 	#[arg(long, env = "VMON_EGRESS_INTERNAL_ALLOW", value_delimiter = ',')]
-	egress_internal_allow:   Vec<String>,
+	egress_internal_allow: Vec<String>,
 	/// Docker Hub pull-through mirror tried first for anonymous `docker.io`
 	/// template base images, e.g. `https://mirror.gcr.io` (falls back to
 	/// Docker Hub).
 	#[arg(long, env = "VMON_REGISTRY_MIRROR")]
-	registry_mirror:         Option<String>,
+	registry_mirror: Option<String>,
 	/// Operator object store (<s3://bucket/prefix> or
 	/// <https://endpoint/bucket/prefix>): portable paused sandboxes and S3
 	/// volumes. Credentials/region/endpoint from `VMON_S3_*` or the AWS
 	/// environment and workload role.
 	#[arg(long, env = "VMON_OBJECT_STORE")]
-	object_store:            Option<String>,
+	object_store: Option<String>,
 	/// Resume paused sandboxes of other nodes lazily from the object store
 	/// (rootfs blocks on demand; on Linux guest memory too); `false` always
 	/// downloads the whole paused state first.
 	#[arg(long, env = "VMON_LAZY_RESUME", default_value_t = true, action = clap::ArgAction::Set)]
-	lazy_resume:             bool,
+	lazy_resume: bool,
 	/// Let `vmonS3Mounts` endpoints resolve to loopback/private/link-local
 	/// addresses (off: the node would reach its own network for users).
 	#[arg(long, env = "VMON_S3_MOUNTS_ALLOW_PRIVATE")]
 	s3_mounts_allow_private: bool,
 	/// Volume directory (default: <data-dir>/volumes).
 	#[arg(long, env = "VMON_VOLUMES_DIR")]
-	volumes_dir:             Option<PathBuf>,
+	volumes_dir: Option<PathBuf>,
 	/// The volume directory is shared storage visible to every node.
 	#[arg(long, env = "VMON_SHARED_VOLUMES")]
-	shared_volumes:          bool,
+	shared_volumes: bool,
 	/// vCPUs offered to sandboxes (default: host CPUs).
 	#[arg(long, env = "VMON_MAX_VCPUS")]
-	max_vcpus:               Option<u32>,
+	max_vcpus: Option<u32>,
 	/// Memory offered to sandboxes in MiB (default: host memory).
 	#[arg(long, env = "VMON_MAX_MEMORY_MB")]
-	max_memory_mb:           Option<u64>,
+	max_memory_mb: Option<u64>,
+	/// Legacy scheduling, Linux kernel-enforced caps, or portable reservation
+	/// caps.
+	#[arg(long, env = "VMON_RESOURCE_POLICY", value_enum, default_value = "legacy")]
+	resource_policy: ResourcePolicyArg,
+	/// Aggregate workload vCPU reservations (no overcommit).
+	#[arg(long, env = "VMON_RESOURCE_VCPUS", default_value_t = 0)]
+	resource_vcpus: u32,
+	/// Aggregate workload memory reservations, including per-VMM overhead, in
+	/// MiB.
+	#[arg(long, env = "VMON_RESOURCE_MEMORY_MB", default_value_t = 0)]
+	resource_memory_mb: u64,
+	/// Host memory allowance charged in addition to every VM's full guest RAM.
+	#[arg(long, env = "VMON_RESOURCE_OVERHEAD_MB", default_value_t = 512)]
+	resource_overhead_mb: u64,
+	/// Host available-memory floor after outstanding commitments, in MiB.
+	#[arg(long, env = "VMON_RESOURCE_HOST_RESERVE_MB", default_value_t = 4096)]
+	resource_host_reserve_mb: u64,
+	/// Extra available memory needed to reopen admission after pressure, in MiB.
+	#[arg(long, env = "VMON_RESOURCE_HYSTERESIS_MB", default_value_t = 1024)]
+	resource_hysteresis_mb: u64,
+	/// Delegated cgroup v2 root; defaults to the service's current cgroup.
+	#[arg(long, env = "VMON_RESOURCE_CGROUP")]
+	resource_cgroup: Option<PathBuf>,
 	/// Node role on Linux: reserve this many MiB of 2 MiB hugetlb pages
 	/// (`vm.nr_hugepages`) at startup for sandbox RAM restored from snapshots
 	/// (create, resume, fork). 0 leaves the host setting alone.
 	#[arg(long, env = "VMON_HUGEPAGE_POOL_MB", default_value_t = 0)]
-	hugepage_pool_mb:        u64,
+	hugepage_pool_mb: u64,
 	/// Driver role: default template of vmon CI runner sandboxes (`runs-on:
 	/// vmon…` jobs without `from=`).
 	#[arg(long, env = "VMON_CI_TEMPLATE", default_value = "ci")]
-	ci_template:             String,
+	ci_template: String,
 	/// Driver role: GitHub REST API base URL of vmon CI (tests point it at a
 	/// fake).
 	#[arg(long, env = "VMON_CI_GITHUB_API", default_value = "https://api.github.com", hide = true)]
-	ci_github_api:           String,
+	ci_github_api: String,
 }
 
 fn parse_uid_gid(raw: &str) -> Result<(u32, u32), String> {
@@ -236,6 +268,34 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 		Roles { node: args.role.contains(&Role::Node), driver: args.role.contains(&Role::Driver) };
 	if !roles.node && !roles.driver {
 		bail!("--role must include node and/or driver");
+	}
+	let resources = ResourceConfig {
+		policy:          match args.resource_policy {
+			ResourcePolicyArg::Legacy => ResourcePolicy::Legacy,
+			ResourcePolicyArg::Strict => ResourcePolicy::Strict,
+			ResourcePolicyArg::Reserved => ResourcePolicy::Reserved,
+		},
+		vcpus:           args.resource_vcpus,
+		memory_mb:       args.resource_memory_mb,
+		overhead_mb:     args.resource_overhead_mb,
+		host_reserve_mb: args.resource_host_reserve_mb,
+		hysteresis_mb:   args.resource_hysteresis_mb,
+		cgroup:          args.resource_cgroup.clone(),
+	};
+	resources.validate()?;
+	if resources.policy != ResourcePolicy::Legacy {
+		if !roles.node {
+			bail!("resource policy requires the node role");
+		}
+		if args.hugepage_pool_mb > 0 {
+			bail!("bounded nodes cannot reserve or use explicit hugetlb pages");
+		}
+		if args.max_vcpus.is_some() || args.max_memory_mb.is_some() {
+			bail!("use --resource-vcpus/--resource-memory-mb instead of legacy capacity overrides");
+		}
+		if args.boot_concurrency > 1 || args.max_builds > 1 {
+			bail!("bounded nodes support one concurrent boot and one build");
+		}
 	}
 
 	let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
@@ -315,32 +375,30 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 			tracing::warn!("--hugepage-pool-mb is only supported on Linux");
 		}
 		let config = NodeConfig {
-			data_dir:                data_dir.clone(),
-			run_dir:                 args.run_dir.clone().unwrap_or_else(default_run_dir),
-			kernel:                  args.kernel.clone(),
-			agent:                   args.agent.clone(),
-			gpu_driver:              args.gpu_driver.clone(),
-			vmon_bin:                std::env::current_exe().context("locating the vmon binary")?,
-			boot_concurrency:        args.boot_concurrency,
-			max_parallel_builds:     args.max_builds,
-			step_cache_mb:           args.step_cache_mb,
-			ci_cache_mb:             args.ci_cache_mb,
-			ci_bazel_cache_mb:       args.ci_bazel_cache_mb,
-			ci_results_upstream:     Some(args.ci_results_upstream.clone()),
-			net_mode:                args.net.into(),
-			net_pool:                args.net_pool.clone(),
-			volumes_dir:             args.volumes_dir.clone(),
-			shared_volumes:          args.shared_volumes,
-			capacity:                CapacityOverrides {
-				cpus:      args.max_vcpus,
-				memory_mb: args.max_memory_mb,
-			},
-			cluster_secret:          secret.clone(),
-			vmm_user:                args.vmm_user,
-			egress_internal_allow:   args.egress_internal_allow.clone(),
-			registry_mirror:         args.registry_mirror.clone(),
-			object_store:            object_store.clone(),
-			lazy_resume:             args.lazy_resume,
+			resources,
+			data_dir: data_dir.clone(),
+			run_dir: args.run_dir.clone().unwrap_or_else(default_run_dir),
+			kernel: args.kernel.clone(),
+			agent: args.agent.clone(),
+			gpu_driver: args.gpu_driver.clone(),
+			vmon_bin: std::env::current_exe().context("locating the vmon binary")?,
+			boot_concurrency: args.boot_concurrency,
+			max_parallel_builds: args.max_builds,
+			step_cache_mb: args.step_cache_mb,
+			ci_cache_mb: args.ci_cache_mb,
+			ci_bazel_cache_mb: args.ci_bazel_cache_mb,
+			ci_results_upstream: Some(args.ci_results_upstream.clone()),
+			net_mode: args.net.into(),
+			net_pool: args.net_pool.clone(),
+			volumes_dir: args.volumes_dir.clone(),
+			shared_volumes: args.shared_volumes,
+			capacity: CapacityOverrides { cpus: args.max_vcpus, memory_mb: args.max_memory_mb },
+			cluster_secret: secret.clone(),
+			vmm_user: args.vmm_user,
+			egress_internal_allow: args.egress_internal_allow.clone(),
+			registry_mirror: args.registry_mirror.clone(),
+			object_store: object_store.clone(),
+			lazy_resume: args.lazy_resume,
 			s3_mounts_allow_private: args.s3_mounts_allow_private,
 		};
 		Some(

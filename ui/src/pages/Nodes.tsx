@@ -148,6 +148,18 @@ export function NodesPage() {
                       </td>
                       <td className="muted">
                         {n.os}/{n.arch} · {n.backend}
+                        {n.resources && (
+                          <div className="cell-sub">
+                            {n.resources.enforcement === "cgroup-v2"
+                              ? "Kernel caps"
+                              : "Reservation caps"}
+                          </div>
+                        )}
+                        {n.resources?.admissionReason && (
+                          <div className="cell-sub" title={n.resources.admissionReason}>
+                            Admission paused
+                          </div>
+                        )}
                       </td>
                       <td className="right num">
                         {fmt.int(n.sandboxes)}
@@ -155,15 +167,24 @@ export function NodesPage() {
                       </td>
                       <td>
                         <span className="num">
-                          {n.vcpusUsed} / {n.cpus}
+                          {n.resources?.reservedVcpus ?? n.vcpusUsed} / {n.cpus}
                         </span>
-                        <Meter label="vCPU allocation" used={n.vcpusUsed} total={n.cpus} />
+                        <Meter
+                          label="vCPU allocation"
+                          used={n.resources?.reservedVcpus ?? n.vcpusUsed}
+                          total={n.cpus}
+                        />
                       </td>
                       <td>
                         <span className="num">
-                          {fmt.mib(n.memoryUsedMB)} / {fmt.mib(n.memoryMB)}
+                          {fmt.mib(n.resources?.reservedMemoryMb ?? n.memoryUsedMB)} /{" "}
+                          {fmt.mib(n.memoryMB)}
                         </span>
-                        <Meter label="Memory allocation" used={n.memoryUsedMB} total={n.memoryMB} />
+                        <Meter
+                          label="Memory allocation"
+                          used={n.resources?.reservedMemoryMb ?? n.memoryUsedMB}
+                          total={n.memoryMB}
+                        />
                       </td>
                       <td className="right num muted">{fmt.mib(n.diskFreeMB)}</td>
                       {showGpus && <GpuCell gpus={n.gpus} />}

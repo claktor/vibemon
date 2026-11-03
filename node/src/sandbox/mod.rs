@@ -267,20 +267,27 @@ async fn release_guest_gpus(id: &str, vm: &Vm) -> bool {
 
 /// Owns every sandbox on this node.
 pub struct SandboxManager {
-	config:     ManagerConfig,
-	vms:        VmRuntime,
-	builder:    Builder,
-	egress:     Egress,
-	volumes:    VolumeStore,
-	sandboxes:  Mutex<HashMap<String, Arc<Entry>>>,
+	migration_reservations: Mutex<HashMap<String, MigrationReservation>>,
+	config:                 ManagerConfig,
+	vms:                    VmRuntime,
+	builder:                Builder,
+	egress:                 Egress,
+	volumes:                VolumeStore,
+	sandboxes:              Mutex<HashMap<String, Arc<Entry>>>,
 	/// IDs with a create in flight.
-	pending:    Mutex<HashSet<String>>,
-	generation: AtomicU64,
+	pending:                Mutex<HashSet<String>>,
+	generation:             AtomicU64,
 	/// Cluster KV (paused-generation records); portable pauses need it and
 	/// [`ManagerConfig::object_store`].
-	kv:         Option<Kv>,
+	kv:                     Option<Kv>,
 	/// Per-sandbox S3 mount proxies.
-	s3fs:       S3Fs,
+	s3fs:                   S3Fs,
+}
+
+struct MigrationReservation {
+	request:     crate::api::ReserveSandbox,
+	reservation: crate::resources::Reservation,
+	expires:     std::time::Instant,
 }
 
 /// Removes a pending-create reservation when dropped.
@@ -416,6 +423,67 @@ fn drop_disk(path: &Path) {
 }
 
 impl SandboxManager {
+	pub fn reserve_migration(
+		&self,
+		id: &str,
+		request: crate::api::ReserveSandbox,
+	) -> Result<(), ApiError> {
+		validate_id(id)?;
+		uuid::Uuid::parse_str(&request.token).map_err(|e| ApiError::invalid(e.to_string()))?;
+		let mut holds = self.migration_reservations.lock();
+		let now = std::time::Instant::now();
+		holds.retain(|_, hold| hold.expires > now);
+		let expires = now + Duration::from_secs(60);
+		if let Some(hold) = holds.get_mut(id) {
+			if hold.request != request {
+				return Err(ApiError::conflict(
+					"sandbox already has a different migration reservation",
+				));
+			}
+			hold.expires = expires;
+			return Ok(());
+		}
+		if holds.len() >= 64 {
+			return Err(ApiError::busy("too many pending migration reservations"));
+		}
+		let reservation = self
+			.vms
+			.resources()
+			.reserve(id, request.vcpus, request.memory_mb)
+			.map_err(|e| ApiError::busy(e.to_string()))?;
+		holds.insert(id.into(), MigrationReservation { request, reservation, expires });
+		Ok(())
+	}
+
+	pub fn release_migration(&self, id: &str, token: &str) {
+		let mut holds = self.migration_reservations.lock();
+		if holds.get(id).is_some_and(|h| h.request.token == token) {
+			holds.remove(id);
+		}
+	}
+
+	fn operation_reservation(
+		&self,
+		id: &str,
+		vcpus: u32,
+		memory_mb: u64,
+	) -> Result<crate::resources::Reservation, ApiError> {
+		let mut holds = self.migration_reservations.lock();
+		holds.retain(|_, hold| hold.expires > std::time::Instant::now());
+		if let Some(hold) = holds.get(id) {
+			hold
+				.reservation
+				.fit(vcpus, memory_mb)
+				.map_err(|e| ApiError::busy(e.to_string()))?;
+			return Ok(hold.reservation.clone());
+		}
+		self
+			.vms
+			.resources()
+			.reserve(id, vcpus, memory_mb)
+			.map_err(|e| ApiError::busy(e.to_string()))
+	}
+
 	/// Creates the manager (no sandboxes yet; call [`Self::recover`]).
 	pub fn new(
 		config: ManagerConfig,
@@ -433,6 +501,7 @@ impl SandboxManager {
 		s3fs_config.allow_private = config.s3_mounts_allow_private;
 		let s3fs = S3Fs::new(s3fs_config);
 		Ok(Arc::new(Self {
+			migration_reservations: Mutex::default(),
 			config,
 			vms,
 			builder,
@@ -623,6 +692,10 @@ impl SandboxManager {
 
 	/// Totals over running sandboxes.
 	pub fn usage(&self) -> Usage {
+		self
+			.migration_reservations
+			.lock()
+			.retain(|_, hold| hold.expires > std::time::Instant::now());
 		let sandboxes = self.sandboxes.lock();
 		let mut usage = Usage::default();
 		for entry in sandboxes.values() {
@@ -810,7 +883,11 @@ impl SandboxManager {
 				self.config.gpus.quarantine(id, plan.gpus);
 				net.release().await;
 				self.s3fs.detach_now(id);
-				return Err(ApiError::internal(format!("{error:#}")));
+				return Err(if error.is::<crate::resources::CapacityError>() {
+					ApiError::busy(format!("{error:#}"))
+				} else {
+					ApiError::internal(format!("{error:#}"))
+				});
 			},
 		};
 		match self.prepare_guest(id, &vm, &net, &plan, s3.as_ref()).await {
@@ -1127,7 +1204,24 @@ impl SandboxManager {
 		if self.sandboxes.lock().contains_key(&id) || !self.pending.lock().insert(id.clone()) {
 			return Err(ApiError::conflict(format!("sandbox {id} already exists")));
 		}
-		let _pending = Pending { manager: self, id: id.clone() };
+		let _pending = Pending { manager: self, id };
+		let reservation = self
+			.vms
+			.resources()
+			.reserve(&req.sandbox_id, req.vcpus, req.memory_mb)
+			.map_err(|e| ApiError::busy(e.to_string()))?;
+		let create: std::pin::Pin<
+			Box<dyn Future<Output = Result<SandboxInfo, ApiError>> + Send + '_>,
+		> = Box::pin(self.create_reserved(req, sources));
+		crate::resources::scope(reservation, create).await
+	}
+
+	async fn create_reserved(
+		self: &Arc<Self>,
+		req: CreateSandbox,
+		sources: &[String],
+	) -> Result<SandboxInfo, ApiError> {
+		let id = req.sandbox_id.clone();
 		// Before the artifact: a node without free GPUs answers `busy` at once.
 		let gpus = GpuLease::reserve(&self.config.gpus, &id, req.gpus)?;
 		let artifact = self
@@ -1673,7 +1767,15 @@ impl SandboxManager {
 		let resumed: std::pin::Pin<
 			Box<dyn Future<Output = Result<SandboxInfo, ApiError>> + Send + '_>,
 		> = Box::pin(self.resume_locked(id, &entry, &req, sources));
-		let result = resumed.await;
+		let (vcpus, memory_mb) = {
+			let state = entry.state.lock();
+			(state.meta.vcpus, state.meta.memory_mb)
+		};
+		let reservation = self.operation_reservation(id, vcpus, memory_mb);
+		let result = match reservation {
+			Ok(reservation) => crate::resources::scope(reservation, resumed).await,
+			Err(error) => Err(error),
+		};
 		if result.is_err() && adopted {
 			// Nothing of the adopted sandbox stays behind on a failed resume.
 			self.forget(id, &entry);
@@ -2138,6 +2240,8 @@ impl SandboxManager {
 					Err(error) => {
 						tracing::warn!(sandbox = %id, error = format!("{error:#}"), "dropping sandbox whose VMM is gone");
 						if let Some(pid) = meta.pid
+							&& (!self.vms.resources().bounded()
+								|| self.vms.resources().verify_adoption(&id, pid).is_ok())
 							&& let Ok(pid) = libc::pid_t::try_from(pid)
 						{
 							// SAFETY: kill(2) on the recorded VMM pid; failure is

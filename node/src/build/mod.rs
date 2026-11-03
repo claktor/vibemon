@@ -98,7 +98,7 @@ struct Inner {
 	oci:          OciClient,
 	cache:        StepCache,
 	builds:       Mutex<HashMap<String, Arc<BuildHandle>>>,
-	permits:      Semaphore,
+	permits:      Arc<Semaphore>,
 	running:      AtomicU32,
 	agent_digest: OnceCell<String>,
 	initramfs:    OnceCell<PathBuf>,
@@ -147,6 +147,8 @@ impl BuildFailure {
 /// Error of [`Builder::start`].
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
+	#[error("{0}")]
+	Busy(String),
 	#[error("invalid build request: {0}")]
 	Invalid(String),
 	#[error(transparent)]
@@ -176,7 +178,7 @@ impl Builder {
 		let cache =
 			StepCache::new(cache_dir.join("steps"), config.step_cache_mb.saturating_mul(1 << 20))
 				.context("opening step cache")?;
-		let permits = Semaphore::new(config.max_parallel.max(1));
+		let permits = Arc::new(Semaphore::new(config.max_parallel.max(1)));
 		Ok(Self {
 			inner: Arc::new(Inner {
 				config,
@@ -212,11 +214,28 @@ impl Builder {
 			.store
 			.build_dir(&req.build_id)
 			.map_err(|e| StartError::Invalid(e.to_string()))?;
-		let handle = {
+		let (handle, reservation, permit) = {
 			let mut builds = self.inner.builds.lock();
 			if builds.contains_key(&req.build_id) || self.inner.store.local(&req.build_id).is_some() {
 				return Ok(());
 			}
+			let permit = if self.inner.vms.resources().bounded() {
+				Some(
+					Arc::clone(&self.inner.permits)
+						.try_acquire_owned()
+						.map_err(|_| {
+							StartError::Busy("node build slot is occupied; retry later".into())
+						})?,
+				)
+			} else {
+				None
+			};
+			let reservation = self
+				.inner
+				.vms
+				.resources()
+				.reserve(&format!("build-{}", req.build_id), req.vcpus.max(2), req.memory_mb.max(1024))
+				.map_err(|e| StartError::Busy(e.to_string()))?;
 			std::fs::create_dir_all(&dir).context("creating build dir")?;
 			let handle = Arc::new(BuildHandle {
 				state:    Mutex::new(HandleState {
@@ -229,20 +248,32 @@ impl Builder {
 				finished: CancellationToken::new(),
 			});
 			builds.insert(req.build_id.clone(), handle.clone());
-			handle
+			(handle, reservation, permit)
 		};
 		let builder = self.clone();
-		tokio::spawn(async move { builder.run(req, sources, handle).await });
+		let task: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> =
+			Box::pin(async move { builder.run(req, sources, handle, permit).await });
+		tokio::spawn(crate::resources::scope(reservation, task));
 		Ok(())
 	}
 
-	async fn run(self, req: StartBuild, sources: Sources, handle: Arc<BuildHandle>) {
+	async fn run(
+		self,
+		req: StartBuild,
+		sources: Sources,
+		handle: Arc<BuildHandle>,
+		permit: Option<tokio::sync::OwnedSemaphorePermit>,
+	) {
 		let _finished = handle.finished.clone().drop_guard();
 		let inner = &self.inner;
 		let started = Instant::now();
-		let permit = tokio::select! {
-			permit = inner.permits.acquire() => permit.ok(),
-			() = handle.cancel.cancelled() => None,
+		let permit = if permit.is_some() {
+			permit
+		} else {
+			tokio::select! {
+				permit = Arc::clone(&inner.permits).acquire_owned() => permit.ok(),
+				() = handle.cancel.cancelled() => None,
+			}
 		};
 		let outcome = match permit {
 			None => Err(None),
@@ -250,8 +281,11 @@ impl Builder {
 				handle.state.lock().status = BuildState::Building;
 				inner.running.fetch_add(1, Ordering::Relaxed);
 				let job = pipeline::Job::new(self.clone(), req.clone(), sources, handle.log.clone());
+				let run: std::pin::Pin<
+					Box<dyn Future<Output = Result<ArtifactInfo, BuildFailure>> + Send>,
+				> = Box::pin(job.run());
 				let result = tokio::select! {
-					result = job.run() => result.map_err(Some),
+					result = run => result.map_err(Some),
 					() = handle.cancel.cancelled() => Err(None),
 				};
 				inner.running.fetch_sub(1, Ordering::Relaxed);
@@ -391,8 +425,22 @@ impl Builder {
 		if store.host().snapshot_compatible(&meta.info) {
 			return Ok(meta.info);
 		}
+		let _permit = if self.inner.vms.resources().bounded() {
+			Some(self.inner.permits.try_acquire().map_err(|_| {
+				crate::resources::CapacityError(
+					"template regeneration is waiting for the build slot".into(),
+				)
+			})?)
+		} else {
+			None
+		};
+		let reservation = self.inner.vms.resources().for_launch(
+			&format!("regenerate-{build_id}"),
+			meta.info.vcpus,
+			meta.info.memory_mb,
+		)?;
 		let log = BuildLog::create(&store.build_dir(build_id)?.join("regenerate.log"));
-		pipeline::regenerate_snapshot(self, meta, &log).await
+		crate::resources::scope(reservation, pipeline::regenerate_snapshot(self, meta, &log)).await
 	}
 
 	async fn agent_digest(&self) -> Result<&str> {
@@ -468,6 +516,7 @@ mod tests {
 		let agent = dir.join("agent");
 		std::fs::write(&agent, b"agent").unwrap();
 		let vms = VmRuntime::new(VmRuntimeConfig {
+			resources:        Default::default(),
 			vmon_bin:         dir.join("vmon"),
 			run_dir:          dir.join("run"),
 			boot_concurrency: 1,

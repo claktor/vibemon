@@ -98,19 +98,29 @@ export function NodeDetailPage({ id }: { id: string }) {
             label="vCPU allocated"
             value={
               <>
-                {n.vcpusUsed}
+                {n.resources?.reservedVcpus ?? n.vcpusUsed}
                 <small>/ {n.cpus}</small>
               </>
             }
-            sub={<Meter label="vCPU allocation" used={n.vcpusUsed} total={n.cpus} />}
+            sub={
+              <Meter
+                label="vCPU allocation"
+                used={n.resources?.reservedVcpus ?? n.vcpusUsed}
+                total={n.cpus}
+              />
+            }
           />
           <Stat
             label="Memory allocated"
-            value={fmt.mib(n.memoryUsedMB)}
+            value={fmt.mib(n.resources?.reservedMemoryMb ?? n.memoryUsedMB)}
             sub={
               <>
                 of {fmt.mib(n.memoryMB)}
-                <Meter label="Memory allocation" used={n.memoryUsedMB} total={n.memoryMB} />
+                <Meter
+                  label="Memory allocation"
+                  used={n.resources?.reservedMemoryMb ?? n.memoryUsedMB}
+                  total={n.memoryMB}
+                />
               </>
             }
           />
@@ -139,6 +149,36 @@ export function NodeDetailPage({ id }: { id: string }) {
                 {n.os}/{n.arch}
               </Detail>
               <Detail label="Hypervisor">{n.backend}</Detail>
+              {n.resources && (
+                <>
+                  <Detail label="Resource enforcement">
+                    {n.resources.enforcement === "cgroup-v2"
+                      ? "Linux cgroup v2"
+                      : "Admission only — no kernel CPU/RAM ceiling"}
+                  </Detail>
+                  <Detail label="Admission">{n.resources.admissionReason || "Open"}</Detail>
+                  <Detail label="Pending reservations">{n.resources.pending}</Detail>
+                  <Detail label="VMM overhead">{fmt.mib(n.resources.overheadMb)} per VM</Detail>
+                  <Detail label="Actual charged memory">
+                    {n.resources.actualMemoryMb === null
+                      ? "Unavailable on this platform"
+                      : fmt.mib(n.resources.actualMemoryMb)}
+                  </Detail>
+                  <Detail label="Kernel memory ceiling">
+                    {n.resources.memoryLimitMb === null
+                      ? "None"
+                      : fmt.mib(n.resources.memoryLimitMb)}
+                  </Detail>
+                  <Detail label="Kernel CPU ceiling">
+                    {n.resources.cpuLimitMillis === null
+                      ? "None"
+                      : `${n.resources.cpuLimitMillis / 1000} CPUs`}
+                  </Detail>
+                  <Detail label="Host available memory">
+                    {fmt.mib(n.resources.hostAvailableMb)}
+                  </Detail>
+                </>
+              )}
               <Detail label="CPU">{n.cpuModel || "—"}</Detail>
               <Detail label="Addresses">
                 <span className="chips">

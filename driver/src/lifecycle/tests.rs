@@ -250,6 +250,11 @@ fn fake_routes(node: Shared) -> Router {
 		.route("/node/v1/sandboxes/{id}/snapshot", post(fake_snapshot))
 		.route("/node/v1/sandboxes/{id}/processes", post(fake_process))
 		.route("/node/v1/sandboxes/{id}/adopt", post(migrate::fake_adopt))
+		.route("/node/v1/sandboxes/{id}/reservation", post(migrate::fake_reserve))
+		.route(
+			"/node/v1/sandboxes/{id}/reservation/{token}",
+			axum::routing::delete(migrate::fake_release),
+		)
 		.route("/node/v1/sandboxes/{id}/paused", axum::routing::delete(migrate::fake_drop_paused))
 		.route("/node/v1/artifacts/{id}", axum::routing::delete(fake_delete_artifact))
 		.with_state(node)
